@@ -1,0 +1,115 @@
+# Demo config for tus-rec-24 S3 freehand reconstruction (ETE).
+
+model:
+  name: efficientnet_b1
+  pred_type: parameter
+  label_type: transform
+  in_ch_reg: 1
+  ddf_dirc: Move
+  conv_coords: optimised_coord
+  img_pro_coord: pro_coord
+  batch_norm: BNoff
+  interpolation:
+    method: bilinear
+    volume: fixed_interval
+
+dataset:
+  name: data.datasets.TUS_rec_s3.TUSRecS3Iterable
+  backend: s3
+  bucket: ${oc.env:TUS_REC24_BUCKET,tus-rec-24}
+  region: ${oc.env:TUS_REC24_REGION,us-east-1}
+  endpoint: ${oc.env:TUS_REC24_ENDPOINT,http://172.16.240.77:9000}
+  force_path_style: true
+  prefix:
+    train: train
+    val: val
+    test: val
+  frame_dir: frames
+  tform_dir:
+    train: null
+    val: transfs
+    test: transfs
+  landmark_dir: landmark
+  return_landmarks: false
+  max_keys: 2000
+  calib_file: ${oc.env:TUS_REC24_CALIB,s3://tus-rec-24/train/calib_matrix.csv}
+  resample_factor: 4
+  sampling:
+    pair_mode: adjacent
+    random_pairs_per_slice: null
+    shuffle_slices: true
+    shuffle_pairs: true
+    shuffle_buffer_size: 4096
+    prefetch_slices: 4
+    buffer_emit_prob: 1.0
+    seed: 0
+    num_samples: 100
+    sample_range: 100
+
+dataloader:
+  train:
+    batch_size: 12
+    num_workers: 0
+    shuffle: false
+    drop_last: false
+    pin_memory: false
+  val:
+    batch_size: 1
+    num_workers: 0
+    shuffle: false
+    drop_last: false
+    pin_memory: false
+  test:
+    batch_size: 1
+    num_workers: 0
+    shuffle: false
+    drop_last: false
+    pin_memory: false
+
+optimizer:
+  type: adam
+  lr_rec: 1e-4
+  lr_reg: 1e-4
+
+lr_scheduler:
+  type: null
+
+loss:
+  type: MSE_points
+  reg_weight: 1000
+
+trainer:
+  name: trainers.rec_trainer.Train_Rec_Reg_Model
+  max_epochs: 5
+  max_steps: null
+  log_interval: 500
+  validate_every: 1
+  save_interval: 100
+  info_interval: 1
+  retain_epoch: "00000000"
+  mode:
+    inter: nointer
+    meta: nonmeta
+  rec_trainer:
+    non_improve_maxmum: 1e10
+    reg_loss_weight: 1000
+    val_loss_min: 1e10
+    val_dist_min: 1e10
+    val_loss_min_reg: 1e10
+    option: common_volume
+
+logging:
+  mlflow:
+    tracking_uri: ${oc.env:MLFLOW_TRACKING_URI,http://172.16.240.33:5000}
+    experiment_name: ${oc.env:MLFLOW_EXPERIMENT_NAME,rec}
+    run_name: ${oc.env:MLFLOW_RUN_NAME,null}
+    tags:
+      dataset: tus_rec24
+      model: efficientnet_b1
+    archive_run_dir: true
+    artifact_path: run
+    delete_local_run_dir: false
+
+runtime:
+  gpu_ids: "0"
+  multi_gpu: false

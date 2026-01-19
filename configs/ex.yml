@@ -1,0 +1,49 @@
+trainer:
+  epochs: 50
+  bs: 32
+
+
+data:
+  semi:
+    dataset_type: "SemiSupervisedDataset"
+    labeled_root: "/path/to/synapse/labeled/"
+    unlabeled_root: "/path/to/synapse/unlabeled/"
+    img_suffix: ".nii.gz"
+    label_suffix: ".nii.gz"
+
+    pipeline_l:
+      - { type: "LoadImage" }
+      - { type: "LoadLabel" }
+      - { type: "RandomCrop", size: [256,256] }
+      - { type: "RandomFlip", prob: 0.5 }
+      - { type: "Normalize", mean: 0.0, std: 1.0 }
+      - { type: "ToTensor" }
+
+    pipeline_ul:
+      - { type: "LoadImage" }
+      - { type: "RandomCrop", size: [256,256] }
+      - { type: "RandomFlip", prob: 0.5 }
+      - { type: "StrongAugment" }
+      - { type: "Normalize", mean: 0.0, std: 1.0 }
+      - { type: "ToTensor" }
+
+    pipeline_mix:
+      - { type: "CutMix", alpha: 1.0 }
+
+
+logging:
+  loggers:
+    - type: tensorboard
+      log_dir: ./runs
+    - type: text
+      log_file: ./logs/train.log
+
+  log_every_steps: 100
+
+eval:
+  interval: 2
+
+checkpoint:
+  interval: 5
+  metric_name: val_dice
+  mode: max

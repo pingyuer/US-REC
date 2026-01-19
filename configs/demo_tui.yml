@@ -1,0 +1,131 @@
+# TUI Dataset Demo Configuration
+
+model:
+  name: unet
+  num_classes: 2
+  bilinear: true
+
+dataset:
+  name: data.datasets.TUI_s3.TUIS3
+  bucket: ${oc.env:TUI_BUCKET,tui}
+  # train/val share one prefix; test uses a separate prefix and has no split file.
+  prefix:
+    train: ${oc.env:TUI_PREFIX,TUI_train}
+    val: ${oc.env:TUI_PREFIX,TUI_train}
+    test: ${oc.env:TUI_TEST_PREFIX,TUI_test}
+  img_dir: ${oc.env:TUI_IMG_DIR,imgs}
+  label_path: ${oc.env:TUI_LABEL_PATH,Description.json}
+  region: ${oc.env:TUI_REGION,us-east-1}
+  endpoint: ${oc.env:TUI_ENDPOINT,http://172.16.240.77:9000}
+  split_file:
+    train: ${oc.env:TUI_TRAIN_SPLIT,filter/train_list.txt}
+    val: ${oc.env:TUI_VAL_SPLIT,filter/val_list.txt}
+    test: null
+  # Credentials: use env vars, do NOT hardcode in YAML.
+  # export AWS_ACCESS_KEY_ID=...
+  # export AWS_SECRET_ACCESS_KEY=...
+
+dataloader:
+  train:
+    batch_size: 8
+    num_workers: 4
+    shuffle: true
+    drop_last: true
+    pin_memory: false
+  val:
+    batch_size: 4
+    num_workers: 4
+    shuffle: false
+    drop_last: false
+    pin_memory: false
+
+pipeline:
+  # registry pipeline: sample(dict) -> sample(dict)
+  train:
+    - type: LoadRawBytes
+    - type: DecodeImage
+    - type: BuildMaskFromSegments
+    - type: ApplyAlbumentations
+      transforms:
+        - type: SmallestMaxSize
+          max_size: 256
+        - type: PadIfNeeded
+          min_height: 256
+          min_width: 256
+        - type: HorizontalFlip
+          p: 0.5
+        - type: VerticalFlip
+          p: 0.5
+        - type: Normalize
+          mean: [0.485, 0.456, 0.406]
+          std: [0.229, 0.224, 0.225]
+        - type: ToTensorV2
+    - type: FinalizeSegSample
+  val:
+    - type: LoadRawBytes
+    - type: DecodeImage
+    - type: BuildMaskFromSegments
+    - type: ApplyAlbumentations
+      transforms:
+        - type: SmallestMaxSize
+          max_size: 256
+        - type: PadIfNeeded
+          min_height: 256
+          min_width: 256
+        - type: Normalize
+          mean: [0.485, 0.456, 0.406]
+          std: [0.229, 0.224, 0.225]
+        - type: ToTensorV2
+    - type: FinalizeSegSample
+  test:
+    - type: LoadRawBytes
+    - type: DecodeImage
+    - type: BuildMaskFromSegments
+    - type: ApplyAlbumentations
+      transforms:
+        - type: SmallestMaxSize
+          max_size: 256
+        - type: PadIfNeeded
+          min_height: 256
+          min_width: 256
+        - type: Normalize
+          mean: [0.485, 0.456, 0.406]
+          std: [0.229, 0.224, 0.225]
+        - type: ToTensorV2
+    - type: FinalizeSegSample
+
+optimizer:
+  type: adamw
+  lr: 1e-4
+  weight_decay: 0.01
+
+lr_scheduler:
+  type: PolyLR
+  max_epochs: 1
+  power: 0.9
+
+loss:
+  type: DiceCELoss
+  dice_weight: 1.0
+  ce_weight: 1.0
+  ignore_index: -100
+  include_background: true
+
+metrics: ["mIoU", "Dice", "Accuracy"]
+
+trainer:
+  max_epochs: 5
+  log_interval: 50
+  eval_interval: 1
+  save_interval: 50
+
+mlflow:
+  tracking_uri: ${oc.env:MLFLOW_TRACKING_URI,http://172.16.240.33:5000}
+  experiment_name: ${oc.env:MLFLOW_EXPERIMENT_NAME,tui_unet}
+  run_name: ${oc.env:MLFLOW_RUN_NAME,null}
+  tags:
+    dataset: tui
+    model: unet
+  archive_run_dir: true
+  artifact_path: run
+  delete_local_run_dir: false

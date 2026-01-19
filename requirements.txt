@@ -1,0 +1,14 @@
+pandas
+einops
+tqdm
+albumentations
+typing_extensions>=4.0
+timm
+omegaconf
+h5py
+s3torchconnector
+opencv-python-headless
+mlflow
+torch
+torchvision
+tensorboard

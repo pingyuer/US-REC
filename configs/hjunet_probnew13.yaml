@@ -1,0 +1,27 @@
+model:
+  name: hjunet_probnew13
+  backbone:
+    embed_dims: [128, 160, 256]
+    decoder_dims: [160, 128, 32, 16]
+  shift:
+    use_shifted_blocks: true
+    shift_size: 5
+  scconv:
+    enabled: true
+    position: ["decoder3", "decoder4"]
+  probabilistic:
+    strategy: mix_mul_add
+    fusion_type: add_cat_norm
+    layers: [2, 3, 4]
+    prior: cbl_linear
+    posterior: vgg_linear
+    use_layernorm: true
+    sample_channels: 160
+  gates:
+    placement: after_decoder3
+    channel_multiplier: 2.0
+  tf_decoder:
+    enabled: true
+    num_queries: 100
+    hidden_dim: 64
+    dim_feedforward: 64

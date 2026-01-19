@@ -1,0 +1,25 @@
+# Python byte-compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+venv/
+.env
+.venv/
+
+# Logs / temp files
+*.log
+*.tmp
+logs/
+*~
+
+# IDE / editor
+.vscode/
+.idea/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+.*
+!.gitignore
