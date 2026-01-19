@@ -128,6 +128,8 @@ class RecEvaluator:
                     intepoletion_method=trainer.intepoletion_method,
                     intepoletion_volume=trainer.intepoletion_volume,
                     voxel_morph_net=voxel_morph_net or trainer.VoxelMorph_net,
+                    use_deform=bool(getattr(trainer, "use_deform", False)),
+                    enable_voxel=bool(getattr(trainer, "enable_voxel", False)),
                 ),
                 scatter_pts_interpolation=lambda labels, pred_pts, frames, step: scatter_pts_interpolation(
                     labels=labels,
@@ -138,10 +140,12 @@ class RecEvaluator:
                     option=trainer.option,
                     intepoletion_method=trainer.intepoletion_method,
                     intepoletion_volume=trainer.intepoletion_volume,
+                    enable_voxel=bool(getattr(trainer, "enable_voxel", False)),
                 ),
                 wrapped_pred_dist_fn=wrapped_pred_dist,
                 convR_batched=convR_batched,
                 minxyz_all=minxyz_all,
+                rigid_only=not bool(getattr(trainer, "nonrigid_enabled", False)),
             )
             loss_sums["loss"] += float(loss.item())
             loss_sums["loss_rec"] += float(loss1.item())

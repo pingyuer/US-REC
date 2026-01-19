@@ -182,8 +182,17 @@ class Train_Rec_Reg_Model:
             tform_calib=self.tform_calib,
             tform_calib_R_T=self.tform_calib_R_T,
         ).to(self.device)
-
-        self.VoxelMorph_net = VoxelMorph(in_channels=self.in_ch_reg, ddf_dirc=self.ddf_dirc).to(self.device)
+        self.nonrigid_enabled = bool(
+            self.use_voxelmorph
+            or self.use_deform
+            or self.use_backward
+            or self.enable_voxel
+            or self.alpha_def
+            or self.alpha_voxel
+        )
+        if self.nonrigid_enabled:
+            raise NotImplementedError("Nonrigid disabled")
+        self.VoxelMorph_net = None
 
     def _init_optimizer(self, reg_loss_weight: float) -> None:
         self.current_epoch = 0
@@ -255,6 +264,7 @@ class Train_Rec_Reg_Model:
             wrapped_pred_dist_fn=wrapped_pred_dist,
             convR_batched=convR_batched,
             minxyz_all=minxyz_all,
+            rigid_only=not self.nonrigid_enabled,
         )
         metrics = {}
         trans_err = translation_error(pred_transfs[..., :3, 3], tforms_each_frame2frame0[..., :3, 3])
@@ -282,7 +292,8 @@ class Train_Rec_Reg_Model:
         self.call_hooks("before_run", mode="train")
         try:
             self.model.train(True)
-            self.VoxelMorph_net.train(True)
+            if self.VoxelMorph_net is not None:
+                self.VoxelMorph_net.train(True)
             switch_off_batch_norm(self.model, self.VoxelMorph_net, self.BatchNorm)
 
             max_iters = self.MAX_ITERS
@@ -359,7 +370,8 @@ class Train_Rec_Reg_Model:
                 if val_fre > 0 and epoch in range(0, self.NUM_EPOCHS, val_fre):
                     self.call_hooks("before_val")
                     self.model.train(False)
-                    self.VoxelMorph_net.train(False)
+                    if self.VoxelMorph_net is not None:
+                        self.VoxelMorph_net.train(False)
                     switch_off_batch_norm(self.model, self.VoxelMorph_net, self.BatchNorm)
 
                     rec_eval = RecEvaluator(device=self.device)
@@ -388,35 +400,37 @@ class Train_Rec_Reg_Model:
                         save_path=self.save_path,
                         multi_gpu=self.multi_gpu,
                     )
-                    save_reg_model(
-                        self.VoxelMorph_net,
-                        epoch=epoch,
-                        num_epochs=self.NUM_EPOCHS,
-                        freq_save=self.FREQ_SAVE,
-                        save_path=self.save_path,
-                        multi_gpu=self.multi_gpu,
-                    )
+                    if self.VoxelMorph_net is not None:
+                        save_reg_model(
+                            self.VoxelMorph_net,
+                            epoch=epoch,
+                            num_epochs=self.NUM_EPOCHS,
+                            freq_save=self.FREQ_SAVE,
+                            save_path=self.save_path,
+                            multi_gpu=self.multi_gpu,
+                        )
 
-                    self.val_dist_min_T = save_best_models(
-                        epoch=epoch,
-                        running_dist=epoch_dist_val,
-                        best_dist=self.val_dist_min_T,
-                        save_path=self.save_path,
-                        multi_gpu=self.multi_gpu,
-                        model_T=self.model,
-                        model_R=self.VoxelMorph_net,
-                        tag="val_dist_T",
-                    )
-                    self.val_dist_min_R = save_best_models(
-                        epoch=epoch,
-                        running_dist=epoch_wrap_dist_val,
-                        best_dist=self.val_dist_min_R,
-                        save_path=self.save_path,
-                        multi_gpu=self.multi_gpu,
-                        model_T=self.model,
-                        model_R=self.VoxelMorph_net,
-                        tag="val_dist_R",
-                    )
+                    if self.VoxelMorph_net is not None:
+                        self.val_dist_min_T = save_best_models(
+                            epoch=epoch,
+                            running_dist=epoch_dist_val,
+                            best_dist=self.val_dist_min_T,
+                            save_path=self.save_path,
+                            multi_gpu=self.multi_gpu,
+                            model_T=self.model,
+                            model_R=self.VoxelMorph_net,
+                            tag="val_dist_T",
+                        )
+                        self.val_dist_min_R = save_best_models(
+                            epoch=epoch,
+                            running_dist=epoch_wrap_dist_val,
+                            best_dist=self.val_dist_min_R,
+                            save_path=self.save_path,
+                            multi_gpu=self.multi_gpu,
+                            model_T=self.model,
+                            model_R=self.VoxelMorph_net,
+                            tag="val_dist_R",
+                        )
 
                     if epoch in range(0, self.NUM_EPOCHS, self.FREQ_INFO):
                         print('[Rec - Epoch %d] val-loss-rec=%.3f, val-dist=%.3f' % (epoch, epoch_loss_val_rec, epoch_dist_val))
@@ -465,7 +479,8 @@ class Train_Rec_Reg_Model:
                     )
 
                     self.model.train(True)
-                    self.VoxelMorph_net.train(True)
+                    if self.VoxelMorph_net is not None:
+                        self.VoxelMorph_net.train(True)
                     switch_off_batch_norm(self.model, self.VoxelMorph_net, self.BatchNorm)
             self.call_hooks("after_train")
         except BaseException as exc:
@@ -485,6 +500,8 @@ class Train_Rec_Reg_Model:
             intepoletion_method=self.intepoletion_method,
             intepoletion_volume=self.intepoletion_volume,
             voxel_morph_net=self.VoxelMorph_net,
+            use_deform=self.use_deform,
+            enable_voxel=self.enable_voxel,
         )
 
     def _scatter_pts_interpolation(self, labels, pred_pts, frames, step):
@@ -497,6 +514,7 @@ class Train_Rec_Reg_Model:
             option=self.option,
             intepoletion_method=self.intepoletion_method,
             intepoletion_volume=self.intepoletion_volume,
+            enable_voxel=self.enable_voxel,
         )
 
     def load_best_rec_model(self):
@@ -510,6 +528,9 @@ class Train_Rec_Reg_Model:
             print('No best rec model saved at the moment...')
 
     def load_best_reg_model(self):
+        if self.VoxelMorph_net is None:
+            print("Nonrigid disabled: skipping reg model load.")
+            return
         try:
             load_model(
                 self.VoxelMorph_net,
@@ -530,6 +551,8 @@ class Train_Rec_Reg_Model:
             raise RuntimeError('No best model saved at the moment...')
 
     def load_def_model_initial(self):
+        if self.VoxelMorph_net is None:
+            raise RuntimeError("Nonrigid disabled")
         try:
             load_model(
                 self.VoxelMorph_net,
@@ -542,6 +565,7 @@ class Train_Rec_Reg_Model:
     def multi_model(self):
         if self.multi_gpu:
             self.model = nn.DataParallel(self.model)
-            self.VoxelMorph_net = nn.DataParallel(self.VoxelMorph_net)
+            if self.VoxelMorph_net is not None:
+                self.VoxelMorph_net = nn.DataParallel(self.VoxelMorph_net)
             print('multi-gpu')
             print(os.environ["CUDA_VISIBLE_DEVICES"])

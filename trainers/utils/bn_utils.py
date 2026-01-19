@@ -20,6 +20,9 @@ def switch_off_batch_norm(model, voxel_morph_net, batch_norm_flag: str) -> None:
                 mod.bias.zero_()
                 mod.momentum = 1
 
+    if voxel_morph_net is None:
+        return
+
     for mod in voxel_morph_net.modules():
         if isinstance(mod, nn.BatchNorm2d):
             mod.reset_parameters()

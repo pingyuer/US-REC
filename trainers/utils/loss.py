@@ -27,6 +27,7 @@ def compute_loss(
     wrapped_pred_dist_fn,
     convR_batched=None,
     minxyz_all=None,
+    rigid_only: bool = True,
 ):
     """Compute loss, auxiliary losses, and metrics for a batch."""
     loss1 = criterion(pred_pts, labels)
@@ -36,7 +37,6 @@ def compute_loss(
     ddf = None
     gt_volume = None
     pred_volume = None
-    rigid_only = True
     non_rigid_loss_types = {"reg", "rec_reg", "wraped", "rec_volume", "rec_volume10000", "volume_only"}
 
     if rigid_only and loss_type in non_rigid_loss_types:

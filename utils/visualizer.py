@@ -83,19 +83,31 @@ class Visualizer_plot_volume():  # plot scan
             tform_calib_R_T =  self.tform_calib_R_T
             ).to( self.device)
         
-        self.VoxelMorph_net = VoxelMorph(in_channels = self.opt.in_ch_reg,ddf_dirc=self.opt.ddf_dirc).to(self.device)
+        nonrigid_enabled = bool(
+            getattr(self.opt, "use_voxelmorph", False)
+            or getattr(self.opt, "use_deform", False)
+            or getattr(self.opt, "use_backward", False)
+            or getattr(self.opt, "enable_voxel", False)
+            or getattr(self.opt, "alpha_def", 0.0)
+            or getattr(self.opt, "alpha_voxel", 0.0)
+        )
+        if nonrigid_enabled:
+            raise NotImplementedError("Nonrigid disabled")
+        self.VoxelMorph_net = None
         self.model.load_state_dict(torch.load(os.path.join(self.opt.SAVE_PATH, self.opt_test.MODEL_FN,self.model_name[0]), map_location=torch.device(self.device)))
         
-        try:
-            # if self.opt.in_ch_reg == 1 and opt.ddf_dirc == 'Move':
-            # if opt.in_ch_reg=2, the wrapped prediction cannot be used as the final output as it contains ground truth
-            self.VoxelMorph_net.load_state_dict(torch.load(os.path.join(self.opt.SAVE_PATH,self.opt_test.MODEL_FN, self.model_name[1]),map_location=torch.device(self.device)))
-        except:
-            print('No R model loaded')
+        if self.VoxelMorph_net is not None:
+            try:
+                # if self.opt.in_ch_reg == 1 and opt.ddf_dirc == 'Move':
+                # if opt.in_ch_reg=2, the wrapped prediction cannot be used as the final output as it contains ground truth
+                self.VoxelMorph_net.load_state_dict(torch.load(os.path.join(self.opt.SAVE_PATH,self.opt_test.MODEL_FN, self.model_name[1]),map_location=torch.device(self.device)))
+            except:
+                print('No R model loaded')
 
         
         self.model.train(False)
-        self.VoxelMorph_net.train(False)
+        if self.VoxelMorph_net is not None:
+            self.VoxelMorph_net.train(False)
 
         # evaluation metrics initialistion
         self.T_Global_AllPts_Dist = []
@@ -519,7 +531,7 @@ class Visualizer_plot_volume():  # plot scan
         else:
             raise('TBC')
 
-        if self.opt.ddf_dirc == 'Move':
+        if self.opt.ddf_dirc == 'Move' and self.VoxelMorph_net is not None:
             # generate wrapped fixed
             warped, ddf = self.VoxelMorph_net(moving = torch.unsqueeze(pred_volume, 1), 
                             fixed = torch.unsqueeze(gt_volume, 1))

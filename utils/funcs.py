@@ -21,6 +21,9 @@ def compute_common_volume(labels_gt,pred_pts,device):
 def wrapped_pred_dist(ddf,pred_pts,gt_pts,option, H, W,convR_batched,minxyz_all,device):
     # compute the loss distence between wrapped prediction and ground truth,
     # where wrapped prediction is the predicted points + DDF, and DDF is the displacement vector based on prediction volume (moving)
+    if ddf is None:
+        zero = torch.tensor(0.0, device=device)
+        return zero, zero, pred_pts
     
     # Note: pred_pts are gt_pts base on the optimised coordinates system
     common_volume = compute_common_volume(gt_pts,pred_pts,device)
@@ -125,7 +128,6 @@ def convert_from_optimised_to_origin(pred_pts_warped_sub,minxyz_all,convR_batche
 
 
     
-
 
 
 

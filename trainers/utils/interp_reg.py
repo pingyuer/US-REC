@@ -16,8 +16,12 @@ def scatter_pts_interpolation(
     option,
     intepoletion_method,
     intepoletion_volume,
+    enable_voxel: bool = False,
 ):
     """Scatter points to volumes for interpolation."""
+    if not enable_voxel:
+        return None, None
+
     common_volume = None
     if option == "common_volume":
         common_volume = compute_common_volume(labels, pred_pts, device)
@@ -60,8 +64,15 @@ def scatter_pts_registration(
     intepoletion_method,
     intepoletion_volume,
     voxel_morph_net,
+    use_deform: bool = False,
+    enable_voxel: bool = False,
 ):
     """Scatter points and apply registration via VoxelMorph net."""
+    if not (use_deform and enable_voxel):
+        return None, None, None, None
+    if voxel_morph_net is None:
+        raise NotImplementedError("Nonrigid disabled")
+
     gt_volume, pred_volume = scatter_pts_interpolation(
         labels=labels,
         pred_pts=pred_pts,
@@ -71,6 +82,7 @@ def scatter_pts_registration(
         option=option,
         intepoletion_method=intepoletion_method,
         intepoletion_volume=intepoletion_volume,
+        enable_voxel=enable_voxel,
     )
 
     warped, ddf = voxel_morph_net(

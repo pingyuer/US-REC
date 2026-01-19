@@ -28,6 +28,10 @@ def parse_rec_cfg(cfg: Any) -> Dict[str, Any]:
     out["Conv_Coords"] = get_cfg_value(cfg, "model.conv_coords")
     out["img_pro_coord"] = get_cfg_value(cfg, "model.img_pro_coord")
     out["BatchNorm"] = get_cfg_value(cfg, "model.batch_norm")
+    out["use_voxelmorph"] = bool(get_cfg_value(cfg, "model.use_voxelmorph", False))
+    out["use_deform"] = bool(get_cfg_value(cfg, "model.use_deform", False))
+    out["use_backward"] = bool(get_cfg_value(cfg, "model.use_backward", False))
+    out["enable_voxel"] = bool(get_cfg_value(cfg, "model.enable_voxel", False))
     out["intepoletion_method"] = get_cfg_value(cfg, "model.interpolation.method")
     out["intepoletion_volume"] = get_cfg_value(cfg, "model.interpolation.volume")
 
@@ -50,6 +54,8 @@ def parse_rec_cfg(cfg: Any) -> Dict[str, Any]:
     )
 
     out["Loss_type"] = get_cfg_value(cfg, "loss.type")
+    out["alpha_def"] = float(get_cfg_value(cfg, "loss.alpha_def", 0.0))
+    out["alpha_voxel"] = float(get_cfg_value(cfg, "loss.alpha_voxel", 0.0))
 
     out["inter"] = get_cfg_value(cfg, "trainer.mode.inter")
     out["meta"] = get_cfg_value(cfg, "trainer.mode.meta")

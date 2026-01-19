@@ -9,6 +9,10 @@ model:
   conv_coords: optimised_coord
   img_pro_coord: pro_coord
   batch_norm: BNoff
+  use_voxelmorph: false
+  use_deform: false
+  use_backward: false
+  enable_voxel: false
   interpolation:
     method: bilinear
     volume: fixed_interval
@@ -77,6 +81,8 @@ lr_scheduler:
 loss:
   type: MSE_points
   reg_weight: 1000
+  alpha_def: 0.0
+  alpha_voxel: 0.0
 
 trainer:
   name: trainers.rec_trainer.Train_Rec_Reg_Model
