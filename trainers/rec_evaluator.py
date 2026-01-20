@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Optional
+import time
 
 import torch
 
@@ -22,6 +23,7 @@ from trainers.utils.forward_utils import (
 )
 from trainers.utils.loss import compute_loss
 from trainers.utils.interp_reg import scatter_pts_interpolation, scatter_pts_registration
+from utils.metrics.tusrec_metrics import compute_tusrec_metrics
 from utils.funcs import wrapped_pred_dist
 
 
@@ -64,6 +66,9 @@ class RecEvaluator:
 
         metric_sums: dict[str, float] = {}
         metric_counts: dict[str, int] = {}
+        tusrec_sums: dict[str, float] = {}
+        tusrec_counts: dict[str, int] = {}
+        tusrec_rows: list[dict[str, Any]] = []
         loss_sums = {
             "loss": 0.0,
             "loss_rec": 0.0,
@@ -73,6 +78,7 @@ class RecEvaluator:
         }
         loss_count = 0
 
+        sample_index = 0
         for batch in loader:
             frames, tforms, tforms_inv = unpack_batch(batch)
             frames = frames.to(self.device)
@@ -82,7 +88,9 @@ class RecEvaluator:
             tforms_each_frame2frame0 = trainer.transform_label(tforms, tforms_inv)
             frames = frames / 255
 
+            start_time = time.perf_counter()
             outputs = model(frames)
+            elapsed = time.perf_counter() - start_time
             pred_transfs = build_pred_transforms(trainer.transform_prediction, outputs, self.device)
             labels, pred_pts = points_from_transforms(
                 img_pro_coord=trainer.img_pro_coord,
@@ -174,6 +182,35 @@ class RecEvaluator:
                 metrics["volume_ssim"] = float(volume_ssim(pred_volume, gt_volume).mean().item())
                 metrics["volume_dice"] = float(volume_dice(pred_volume, gt_volume).mean().item())
 
+            batch_size = int(frames.shape[0]) if frames.ndim >= 4 else 1
+            runtime_per_scan = elapsed / max(batch_size, 1)
+            for idx in range(batch_size):
+                frame_seq = frames[idx] if frames.ndim >= 4 else frames
+                gt_seq = tforms_each_frame2frame0[idx] if tforms_each_frame2frame0.ndim == 4 else tforms_each_frame2frame0
+                pred_seq = pred_transfs[idx] if pred_transfs.ndim == 4 else pred_transfs
+                landmarks = None
+                if isinstance(batch, dict) and "landmarks" in batch:
+                    lm = batch["landmarks"]
+                    if torch.is_tensor(lm):
+                        landmarks = lm[idx] if lm.ndim >= 3 else lm
+                tusrec = compute_tusrec_metrics(
+                    frames=frame_seq,
+                    gt_transforms=gt_seq,
+                    pred_transforms=pred_seq,
+                    calib={"tform_calib": trainer.tform_calib},
+                    landmarks=landmarks,
+                    runtime_s=runtime_per_scan,
+                )
+                row = {"scan_id": f"sample_{sample_index}"}
+                row.update({k: v for k, v in tusrec.items() if v is not None})
+                tusrec_rows.append(row)
+                for key, value in tusrec.items():
+                    if value is None:
+                        continue
+                    tusrec_sums[key] = tusrec_sums.get(key, 0.0) + float(value)
+                    tusrec_counts[key] = tusrec_counts.get(key, 0) + 1
+                sample_index += 1
+
             for key, value in metrics.items():
                 metric_sums[key] = metric_sums.get(key, 0.0) + float(value)
                 metric_counts[key] = metric_counts.get(key, 0) + 1
@@ -201,12 +238,16 @@ class RecEvaluator:
             key: (metric_sums[key] / max(metric_counts.get(key, 1), 1))
             for key in metric_sums
         }
+        for key, value in tusrec_sums.items():
+            avg_metrics[key] = value / max(tusrec_counts.get(key, 1), 1)
         if loss_count > 0:
             avg_metrics[f"{mode}_loss"] = loss_sums["loss"] / loss_count
             avg_metrics[f"{mode}_loss_rec"] = loss_sums["loss_rec"] / loss_count
             avg_metrics[f"{mode}_loss_reg"] = loss_sums["loss_reg"] / loss_count
             avg_metrics[f"{mode}_dist"] = loss_sums["dist"] / loss_count
             avg_metrics[f"{mode}_wrap_dist"] = loss_sums["wrap_dist"] / loss_count
+        if tusrec_rows:
+            avg_metrics["tusrec_per_scan"] = tusrec_rows
 
         for cb in callbacks:
             fn = getattr(cb, "on_end", None)

@@ -2,19 +2,15 @@ import importlib
 import inspect
 import os
 import sys
-import tempfile
-import time
-from pathlib import Path
 from typing import Any, Dict
 
-import mlflow
 import torch
 from omegaconf import OmegaConf
 from torch.utils.tensorboard import SummaryWriter
 
 from data.builder import build_dataset
 from trainers.context import TrainingContext
-from trainers.hooks import LoggerHook
+from trainers.hooks import LoggerHook, MLflowHook
 from trainers.rec_trainer import Train_Rec_Reg_Model  # compat for tests
 
 
@@ -56,46 +52,6 @@ def load_dotenv(path: str = ".env", *, override: bool = False) -> None:
         if not override and key in os.environ:
             continue
         os.environ[key] = value
-
-
-def _flatten_config(cfg) -> Dict[str, str]:
-    def _recurse(value, prefix=""):
-        entries = {}
-        if isinstance(value, dict):
-            for key, field in value.items():
-                next_prefix = f"{prefix}.{key}" if prefix else key
-                entries.update(_recurse(field, next_prefix))
-        else:
-            entries[prefix] = "None" if value is None else str(value)
-        return entries
-
-    container = OmegaConf.to_container(cfg, resolve=True)
-    return _recurse(container)
-
-
-def _mlflow_run_active() -> bool:
-    return mlflow.active_run() is not None
-
-
-def _log_params(params: dict, *, batch_size: int = 64):
-    if not _mlflow_run_active():
-        return
-    items = list(params.items())
-    for idx in range(0, len(items), batch_size):
-        mlflow.log_params(dict(items[idx : idx + batch_size]))
-
-
-def _log_config_artifact(cfg: OmegaConf):
-    if not _mlflow_run_active():
-        return
-    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".yaml")
-    temp_path = temp_file.name
-    temp_file.close()
-    OmegaConf.save(cfg, temp_path)
-    try:
-        mlflow.log_artifact(temp_path, artifact_path="configs")
-    finally:
-        os.remove(temp_path)
 
 
 def _build_rec_trainer(cfg, *, save_path, dset_train, dset_val, device, writer):
@@ -167,49 +123,21 @@ def main():
         writer=writer,
     )
     train_rec_reg_model.ctx = ctx
-
-    mlflow_node = OmegaConf.select(cfg, "logging.mlflow")
-    if mlflow_node is None and hasattr(cfg, "get"):
-        mlflow_node = cfg.get("mlflow")
-    if mlflow_node is None:
-        mlflow_cfg = {}
-    elif OmegaConf.is_config(mlflow_node):
-        mlflow_cfg = OmegaConf.to_container(mlflow_node, resolve=True) or {}
-    elif isinstance(mlflow_node, dict):
-        mlflow_cfg = mlflow_node
-    else:
-        mlflow_cfg = {}
     trainer_cfg = cfg.get("trainer") or {}
     log_interval = int(trainer_cfg.get("log_interval", 50))
     logger_hook = LoggerHook(
         interval=log_interval,
         log_file=str(ctx.log_file),
         console=True,
-        mlflow_enabled=bool(mlflow_cfg),
-        upload_run_dir=bool(OmegaConf.select(cfg, "mlflow.archive_run_dir") or False),
-        delete_local_run_dir=bool(OmegaConf.select(cfg, "mlflow.delete_local_run_dir") or False),
-        artifact_path=str(OmegaConf.select(cfg, "mlflow.artifact_path") or "run"),
+        mlflow_enabled=False,
+        upload_run_dir=False,
+        delete_local_run_dir=False,
+        artifact_path="run",
     )
     train_rec_reg_model.register_hook(logger_hook)
-    if not mlflow_cfg:
-        train_rec_reg_model.multi_model()
-        train_rec_reg_model.train_rec_model()
-        return
-
-    tracking_uri = mlflow_cfg.get("tracking_uri")
-    experiment_name = mlflow_cfg.get("experiment_name") or "default"
-    run_name = mlflow_cfg.get("run_name") or f"{experiment_name}-{int(time.time())}"
-    mlflow.set_tracking_uri(tracking_uri)
-    mlflow.set_experiment(experiment_name)
-    with mlflow.start_run(run_name=run_name, tags=mlflow_cfg.get("tags")) as active_run:
-        run_id = active_run.info.run_id
-        train_rec_reg_model.ctx = ctx.with_mlflow_run_id(run_id)
-        _log_params(_flatten_config(cfg))
-        mlflow.log_param("device", str(device))
-        mlflow.log_param("cuda_available", torch.cuda.is_available())
-        train_rec_reg_model.multi_model()
-        train_rec_reg_model.train_rec_model()
-        _log_config_artifact(cfg)
+    train_rec_reg_model.register_hook(MLflowHook(cfg=cfg))
+    train_rec_reg_model.multi_model()
+    train_rec_reg_model.train_rec_model()
 
 
 if __name__ == "__main__":

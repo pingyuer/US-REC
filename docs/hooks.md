@@ -17,8 +17,8 @@ Defined in `trainers/hooks/base_hook.py` and dispatched by `trainers/trainer.py`
 ### LoggerHook
 File: `trainers/hooks/logger_hook.py`
 - Writes a local heartbeat log (file + optional console)
-- Logs metrics to MLflow when a run is active
-- Optionally uploads `ctx.run_dir` as MLflow artifacts and deletes local run dir after success
+- Logs metrics to MLflow when `MLflowHook` is enabled
+- Uploads configured artifacts to MLflow
 
 ### RecordRawHook
 File: `trainers/hooks/record_raw_hook.py`
@@ -31,4 +31,3 @@ See: `docs/records.md`
 
 ## How hooks are registered
 Current default wiring is in `main.py` (you can add more `trainer.register_hook(...)` calls there).
-

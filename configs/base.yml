@@ -146,12 +146,16 @@ records:
 # MLflow is optional. If you keep it, `main.py` treats it as enabled.
 # Comment out to run fully offline.
 mlflow:
+  enabled: true
   tracking_uri: ${oc.env:MLFLOW_TRACKING_URI,http://172.16.240.33:5000}
   experiment_name: ${oc.env:MLFLOW_EXPERIMENT,tui_unet}
   run_name: null
   tags:
     dataset: tui
     model: unet
-  artifact_path: run
-  archive_run_dir: true
-  delete_local_run_dir: false
+  log_system_metrics: false
+  artifact_subdir: artifacts
+  register_model: false
+  log_model_format: state_dict
+  best_metric: val_loss
+  best_mode: min

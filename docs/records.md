@@ -38,5 +38,4 @@ Notes:
 - `outputs` and `masks` (to export pred/gt masks aligned to the raw image size)
 
 ## MLflow archiving
-If `mlflow.archive_run_dir: true`, `LoggerHook` uploads the whole `ctx.run_dir` at the end of the run, which includes `records/`.
-
+If MLflow is enabled, `MLflowHook` uploads configured artifacts under the run.

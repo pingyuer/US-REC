@@ -106,15 +106,19 @@ trainer:
 
 logging:
   mlflow:
+    enabled: true
     tracking_uri: ${oc.env:MLFLOW_TRACKING_URI,http://172.16.240.33:5000}
     experiment_name: ${oc.env:MLFLOW_EXPERIMENT_NAME,rec}
-    run_name: ${oc.env:MLFLOW_RUN_NAME,null}
+    run_name: ${oc.env:MLFLOW_RUN_NAME,${now:%Y%m%d_%H%M%S}_${model.name}}
     tags:
       dataset: tus_rec24
       model: efficientnet_b1
-    archive_run_dir: true
-    artifact_path: run
-    delete_local_run_dir: false
+    log_system_metrics: false
+    artifact_subdir: artifacts
+    register_model: false
+    log_model_format: state_dict
+    best_metric: final_score
+    best_mode: max
 
 runtime:
   gpu_ids: "0"

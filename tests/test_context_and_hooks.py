@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader, Dataset
 from trainers.context import TrainingContext
 from trainers.hooks.base_hook import Hook
 from trainers.hooks.logger_hook import LoggerHook
+from trainers.hooks.mlflow_hook import MLflowHook
 from trainers.trainer import Trainer
 
 
@@ -152,41 +153,52 @@ def test_logger_hook_writes_local_log(tmp_path):
     assert "[val]" in content
 
 
-def test_logger_hook_uploads_and_deletes_run_dir_when_configured(tmp_path, monkeypatch):
+def test_mlflow_hook_logs_checkpoints(tmp_path):
     cfg = make_cfg(max_epochs=1, log_interval=1, eval_interval=1)
     ctx = TrainingContext.create(exp_name="exp", run_name="run", root_dir=tmp_path)
     ctx.save_config(cfg)
     trainer = make_trainer(cfg=cfg, ctx=ctx)
 
-    calls = {"log_artifacts": 0}
+    class FakeLogger:
+        def __init__(self):
+            self.artifacts = []
 
-    class FakeMlflow:
-        def active_run(self):
-            return object()
+        def start_run(self, **_):
+            return
 
-        def log_artifacts(self, local_dir, artifact_path=None):
-            calls["log_artifacts"] += 1
+        def log_params(self, *_):
+            return
 
-        def log_metric(self, *args, **kwargs):
-            pass
+        def log_metrics(self, *_ , **__):
+            return
 
-    monkeypatch.setattr("trainers.hooks.logger_hook.mlflow", FakeMlflow())
+        def log_artifact(self, path, artifact_path=None):
+            self.artifacts.append((path, artifact_path))
 
+        def log_model(self, *_ , **__):
+            return
+
+        def set_tags(self, *_):
+            return
+
+        def flush(self):
+            return
+
+        def close(self):
+            return
+
+    fake_logger = FakeLogger()
     trainer.register_hook(
-        LoggerHook(
-            interval=1,
-            log_file=str(ctx.log_file),
-            console=False,
-            mlflow_enabled=True,
-            upload_run_dir=True,
-            delete_local_run_dir=True,
-            artifact_path="run",
+        MLflowHook(
+            cfg=cfg,
+            logger=fake_logger,
         )
     )
     trainer.run("train")
 
-    assert calls["log_artifacts"] == 1
-    assert not ctx.run_dir.exists()
+    assert any("checkpoints/best" in (artifact_path or "") for _, artifact_path in fake_logger.artifacts)
+    assert any("checkpoints/last" in (artifact_path or "") for _, artifact_path in fake_logger.artifacts)
+    assert ctx.run_dir.exists()
 
 
 def test_trainer_run_calls_hooks_for_test_mode(tmp_path):

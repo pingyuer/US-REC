@@ -1,18 +1,16 @@
 import argparse
 import os
-import tempfile
-import time
 from pathlib import Path
 
-import mlflow
 import torch
 from omegaconf import OmegaConf
 
 from data.builder import build_dataset, build_dataloader
 from models import build_model
 from trainers.context import TrainingContext
-from trainers.hooks import CheckpointHook, LoggerHook, RecordRawHook
+from trainers.hooks import CheckpointHook, LoggerHook, MLflowHook, RecordRawHook
 from trainers.trainer import Trainer
+from utils.loggers import MLflowExperimentLogger
 
 
 def load_dotenv(path: str = ".env", *, override: bool = False) -> None:
@@ -72,11 +70,16 @@ def _maybe_load_checkpoint_for_test(trainer: Trainer, *, which: str) -> None:
 
 
 def _load_best_model_from_mlflow(*, run_id: str, cfg, trainer: Trainer) -> None:
-    # Download the best_model checkpoint from the given run_id and load it.
     mlflow_cfg = OmegaConf.to_container(cfg.get("mlflow") or {}, resolve=True) or {}
-    base = str(mlflow_cfg.get("artifact_path") or "run").strip("/")
-    artifact_path = f"{base}/checkpoints/best_model.pth"
-    local_path = mlflow.artifacts.download_artifacts(run_id=run_id, artifact_path=artifact_path)
+    best_metric = str(mlflow_cfg.get("best_metric") or "val_loss")
+    artifact_path = f"checkpoints/best/best_{best_metric}.pt"
+    local_path = MLflowExperimentLogger.download_artifact(
+        run_id=run_id,
+        artifact_path=artifact_path,
+    )
+    if not local_path:
+        print(f"[mlflow] failed to download artifact={artifact_path} from run_id={run_id}")
+        return
     _load_checkpoint_into_model(trainer, Path(local_path))
     print(f"[mlflow] loaded best_model from run_id={run_id} artifact={artifact_path}")
 
@@ -153,57 +156,6 @@ def load_config(config_path: str, override_list: list):
         base_cfg = OmegaConf.merge(base_cfg, override_cfg)
 
     return base_cfg
-
-
-def _flatten_config(cfg: OmegaConf) -> dict:
-    """Flatten nested OmegaConf config into dot-delimited params."""
-
-    def _recurse(value, prefix=""):
-        entries = {}
-        if isinstance(value, dict):
-            for key, field in value.items():
-                next_prefix = f"{prefix}.{key}" if prefix else key
-                entries.update(_recurse(field, next_prefix))
-        else:
-            low = prefix.lower()
-            if any(s in low for s in ("secret", "password", "token", "access_key")):
-                entries[prefix] = "***"
-                return entries
-            entries[prefix] = "None" if value is None else str(value)
-        return entries
-
-    container = OmegaConf.to_container(cfg, resolve=True)
-    return _recurse(container)
-
-
-def _mlflow_run_active() -> bool:
-    """Return True when an MLflow run exists."""
-    return mlflow.active_run() is not None
-
-
-def _log_params(params: dict, *, batch_size: int = 32):
-    """Batch MLflow parameter logging to respect API limits."""
-    if not _mlflow_run_active():
-        return
-    items = list(params.items())
-    for idx in range(0, len(items), batch_size):
-        batch = dict(items[idx : idx + batch_size])
-        mlflow.log_params(batch)
-
-
-def _log_config_artifact(cfg: OmegaConf):
-    """Dump the active config as a YAML file and log it as an MLflow artifact."""
-    if not _mlflow_run_active():
-        return
-    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".yaml")
-    temp_path = temp_file.name
-    temp_file.close()
-    OmegaConf.save(cfg, temp_path)
-
-    try:
-        mlflow.log_artifact(temp_path, artifact_path="configs")
-    finally:
-        os.remove(temp_path)
 
 
 def main():
@@ -307,12 +259,13 @@ def main():
             interval=int(cfg.trainer.get("log_interval", 50)),
             log_file=str(ctx.log_file),
             console=True,
-            mlflow_enabled=bool(cfg.get("mlflow")),
-            upload_run_dir=bool(OmegaConf.select(cfg, "mlflow.archive_run_dir") or False),
-            delete_local_run_dir=bool(OmegaConf.select(cfg, "mlflow.delete_local_run_dir") or False),
-            artifact_path=str(OmegaConf.select(cfg, "mlflow.artifact_path") or "run"),
+            mlflow_enabled=False,
+            upload_run_dir=False,
+            delete_local_run_dir=False,
+            artifact_path="run",
         )
     )
+    trainer.register_hook(MLflowHook(cfg=cfg))
 
     records_cfg = cfg.get("records")
     if records_cfg and bool(records_cfg.get("enabled", False)):
@@ -331,68 +284,14 @@ def main():
         )
     print("✅ Trainer built\n")
 
-    mlflow_cfg = OmegaConf.to_container(cfg.get("mlflow") or {}, resolve=True) or {}
-    mlflow_enabled = bool(mlflow_cfg)
-
-    params = _flatten_config(cfg)
-
-    if not mlflow_enabled:
-        print("[4/6] Starting run (MLflow disabled)...")
-        if args.load_mlflow_best:
-            print("❌ --load-mlflow-best requires mlflow config enabled.")
-            return
-        trainer.run(args.mode)
-        if args.mode == "train" and args.run_test:
-            _maybe_load_checkpoint_for_test(trainer, which=args.test_from)
-            trainer.run("test")
-        print("[5/6] Run completed!")
-        return
-
-    tracking_uri = mlflow_cfg.get("tracking_uri")
-    experiment_name = mlflow_cfg.get("experiment_name") or "default"
-    run_name = mlflow_cfg.get("run_name") or f"{experiment_name}-{int(time.time())}"
-    mlflow.set_tracking_uri(tracking_uri)
-    mlflow.set_experiment(experiment_name)
-
-    print("[5/6] Starting run...")
-    with mlflow.start_run(run_name=run_name, tags=mlflow_cfg.get("tags")) as active_run:
-        run_id = active_run.info.run_id
-        print(f"📡 MLflow run {run_id} (experiment={experiment_name})")
-        trainer.ctx = ctx.with_mlflow_run_id(run_id)
-        _log_params(params)
-        mlflow.log_param("device", str(device))
-        mlflow.log_param("cuda_available", torch.cuda.is_available())
-
-        if args.load_mlflow_best:
-            _load_best_model_from_mlflow(run_id=args.load_mlflow_best, cfg=cfg, trainer=trainer)
-
-        trainer.run(args.mode)
-        if args.mode == "train" and args.run_test:
-            _maybe_load_checkpoint_for_test(trainer, which=args.test_from)
-            trainer.run("test")
-
-        # Prefer metrics already produced during the run. Avoid doing an extra
-        # full validation/test pass at the end (can be very expensive).
-        final_metrics = getattr(trainer, "last_val_metrics", None) or getattr(trainer, "last_test_metrics", None) or {}
-
-        if "val_loss" in final_metrics:
-            mlflow.log_metric("final_val_loss", float(final_metrics["val_loss"]))
-        if "test_loss" in final_metrics:
-            mlflow.log_metric("final_test_loss", float(final_metrics["test_loss"]))
-        mlflow.log_metric("epochs", trainer.epoch + 1)
-
-        best_metric = trainer.best_metric
-        best_epoch = trainer.best_epoch + 1
-        if best_metric == float("inf") and "val_loss" in final_metrics:
-            best_metric = float(final_metrics["val_loss"])
-            best_epoch = trainer.epoch + 1
-
-        mlflow.log_metric("best_val_loss", best_metric)
-        mlflow.log_metric("best_epoch", best_epoch)
-
-        _log_config_artifact(cfg)
-
-    print("[6/6] Run completed!")
+    print("[4/6] Starting run...")
+    if args.load_mlflow_best:
+        _load_best_model_from_mlflow(run_id=args.load_mlflow_best, cfg=cfg, trainer=trainer)
+    trainer.run(args.mode)
+    if args.mode == "train" and args.run_test:
+        _maybe_load_checkpoint_for_test(trainer, which=args.test_from)
+        trainer.run("test")
+    print("[5/6] Run completed!")
 
 
 if __name__ == "__main__":

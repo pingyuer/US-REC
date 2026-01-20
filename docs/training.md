@@ -46,7 +46,8 @@ Trainer events are dispatched to hooks:
 - eval lifecycle: `before_val/after_val`, `before_test/after_test`
 
 Built-ins:
-- `LoggerHook`: local log + MLflow metrics + archive run dir
+- `LoggerHook`: local log only
+- `MLflowHook`: MLflow params/metrics/artifacts
 - `RecordRawHook`: record raw images + optional pred/gt masks during eval/test
 
 See: `docs/hooks.md`, `docs/records.md`, `docs/mlflow.md`.

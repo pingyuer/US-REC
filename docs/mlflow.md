@@ -1,6 +1,6 @@
 # MLflow
 
-This project uses MLflow in `main.py` and keeps most observability in hooks.
+This project uses MLflow via `MLflowHook` and a logger adapter.
 
 ## Minimal config
 
@@ -21,7 +21,7 @@ mlflow:
 
 Notes:
 - If `mlflow` block is missing, MLflow is disabled and training still runs.
-- Metrics are logged by `LoggerHook` when a run is active (`mlflow.start_run(...)`).
+- Metrics and artifacts are logged by `MLflowHook` when `mlflow.enabled: true`.
 - Artifacts are archived by `LoggerHook.after_run()` by uploading the whole `ctx.run_dir`.
 
 ## What gets uploaded
@@ -36,4 +36,3 @@ By default (depending on enabled hooks/config), artifacts include:
 ```bash
 RUN_MLFLOW_INTEGRATION=1 pytest -q tests/test_mlflow_integration.py
 ```
-

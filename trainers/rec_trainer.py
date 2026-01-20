@@ -473,8 +473,15 @@ class Train_Rec_Reg_Model:
                                     "val_loss_reg",
                                     "val_dist",
                                     "val_wrap_dist",
+                                    "tusrec_per_scan",
                                 }
+                                and isinstance(v, (int, float))
                             },
+                            **(
+                                {"tusrec_per_scan": metrics.get("tusrec_per_scan")}
+                                if "tusrec_per_scan" in metrics
+                                else {}
+                            ),
                         },
                     )
 
