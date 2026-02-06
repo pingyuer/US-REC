@@ -252,17 +252,15 @@ def compute_tusrec_metrics(
         if None not in (gpe_norm, gle_norm, lpe_norm, lle_norm):
             final_score = float(0.25 * (gpe_norm + gle_norm + lpe_norm + lle_norm))
 
-    runtime_ms = float(runtime_s * 1000.0) if runtime_s is not None else None
-
     return {
-        "GPE": gpe,
-        "GLE": gle,
-        "LPE": lpe,
-        "LLE": lle,
+        "GPE_mm": gpe,
+        "GLE_mm": gle,
+        "LPE_mm": lpe,
+        "LLE_mm": lle,
         "GPE_norm": gpe_norm,
         "GLE_norm": gle_norm,
         "LPE_norm": lpe_norm,
         "LLE_norm": lle_norm,
         "final_score": final_score,
-        "runtime_ms_per_scan": runtime_ms,
+        "runtime_s_per_scan": float(runtime_s) if runtime_s is not None else None,
     }

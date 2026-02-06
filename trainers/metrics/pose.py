@@ -1,74 +1,99 @@
+# trainers/metrics/pose.py
+"""Pose metrics with explicit units and stable rotation error."""
+
 from __future__ import annotations
+
+from typing import Optional
+import warnings
 
 import torch
 
 
-def _to_rotation_matrix(rot: torch.Tensor) -> torch.Tensor:
-    if rot.shape[-2:] != (3, 3):
-        raise ValueError("Rotation input must have shape (..., 3, 3).")
-    return rot
-
-
-def translation_error(pred_trans: torch.Tensor, gt_trans: torch.Tensor) -> torch.Tensor:
+def translation_error_mm(
+    pred_trans: torch.Tensor, gt_trans: torch.Tensor, *, scale: float = 1.0
+) -> torch.Tensor:
     """
-    Compute L2 translation error (meters or mm) for batched translations.
+    L2 translation error in mm.
 
-    Args:
-        pred_trans: Tensor of shape (..., 3) translation vectors.
-        gt_trans: Tensor of shape (..., 3) translation vectors.
-
-    Returns:
-        Tensor of shape (...) with L2 translation error.
-
-    Example:
-        >>> err = translation_error(pred_t, gt_t)
+    scale applies a unit conversion factor (default 1.0).
     """
-    diff = pred_trans - gt_trans
+    diff = (pred_trans - gt_trans) * float(scale)
     return torch.linalg.norm(diff, dim=-1)
 
 
-def rotation_error(pred_rot: torch.Tensor, gt_rot: torch.Tensor) -> torch.Tensor:
+def _project_to_so3(rot: torch.Tensor) -> torch.Tensor:
+    u, _, v = torch.linalg.svd(rot)
+    r = u @ v.transpose(-1, -2)
+    det = torch.det(r)
+    if torch.any(det < 0):
+        u_adj = u.clone()
+        u_adj[..., :, -1] *= -1.0
+        r = u_adj @ v.transpose(-1, -2)
+    return r
+
+
+def rotation_error_deg(
+    pred_rot: torch.Tensor,
+    gt_rot: torch.Tensor,
+    *,
+    check_valid: bool = False,
+    orthonormalize: bool = False,
+    eps: float = 1e-6,
+    valid_tol: float = 1e-2,
+    det_tol: float = 0.9,
+    raise_on_invalid: bool = False,
+) -> torch.Tensor:
     """
-    Compute SO(3) geodesic rotation error in degrees.
-
-    Args:
-        pred_rot: Tensor of shape (..., 3, 3) rotation matrices.
-        gt_rot: Tensor of shape (..., 3, 3) rotation matrices.
-
-    Returns:
-        Tensor of shape (...) with rotation error in degrees.
-
-    Example:
-        >>> rot_err = rotation_error(pred_R, gt_R)
+    SO(3) geodesic rotation error in degrees.
     """
-    pred_rot = _to_rotation_matrix(pred_rot)
-    gt_rot = _to_rotation_matrix(gt_rot)
-    rel = pred_rot @ gt_rot.transpose(-1, -2)
+    if pred_rot.shape[-2:] != (3, 3) or gt_rot.shape[-2:] != (3, 3):
+        raise ValueError("Rotation input must have shape (..., 3, 3).")
+
+    pred = pred_rot
+    gt = gt_rot
+    if orthonormalize:
+        pred = _project_to_so3(pred)
+        gt = _project_to_so3(gt)
+
+    if check_valid:
+        eye = torch.eye(3, device=pred.device, dtype=pred.dtype)
+        pred_err = torch.linalg.norm(pred.transpose(-1, -2) @ pred - eye, dim=(-2, -1))
+        gt_err = torch.linalg.norm(gt.transpose(-1, -2) @ gt - eye, dim=(-2, -1))
+        pred_det = torch.det(pred)
+        gt_det = torch.det(gt)
+        invalid = bool(
+            (pred_err.max() > valid_tol)
+            or (gt_err.max() > valid_tol)
+            or (pred_det.min() < det_tol)
+            or (gt_det.min() < det_tol)
+        )
+        if invalid:
+            msg = "Rotation matrices appear invalid (RtR or det out of tolerance)."
+            if raise_on_invalid:
+                raise ValueError(msg)
+            warnings.warn(msg, RuntimeWarning)
+
+    rel = pred @ gt.transpose(-1, -2)
     trace = rel.diagonal(dim1=-2, dim2=-1).sum(-1)
     cos_theta = (trace - 1.0) * 0.5
-    cos_theta = torch.clamp(cos_theta, -1.0, 1.0)
+    cos_theta = torch.clamp(cos_theta, -1.0 + eps, 1.0 - eps)
     theta = torch.acos(cos_theta)
     return theta * (180.0 / torch.pi)
 
 
-def se3_error(pred_T: torch.Tensor, gt_T: torch.Tensor) -> torch.Tensor:
-    """
-    Combined SE(3) error using translation + rotation (deg) in a single scalar.
+def se3_translation_error(pred_T: torch.Tensor, gt_T: torch.Tensor) -> torch.Tensor:
+    return translation_error_mm(pred_T[..., :3, 3], gt_T[..., :3, 3])
 
-    Args:
-        pred_T: Tensor of shape (..., 4, 4) predicted transforms.
-        gt_T: Tensor of shape (..., 4, 4) ground-truth transforms.
 
-    Returns:
-        Tensor of shape (...) with combined error value.
+def se3_rotation_error_deg(
+    pred_T: torch.Tensor, gt_T: torch.Tensor, **kwargs
+) -> torch.Tensor:
+    return rotation_error_deg(pred_T[..., :3, :3], gt_T[..., :3, :3], **kwargs)
 
-    Example:
-        >>> se3 = se3_error(pred_T, gt_T)
-    """
-    pred_t = pred_T[..., :3, 3]
-    gt_t = gt_T[..., :3, 3]
-    pred_R = pred_T[..., :3, :3]
-    gt_R = gt_T[..., :3, :3]
-    trans_err = translation_error(pred_t, gt_t)
-    rot_err = rotation_error(pred_R, gt_R)
-    return trans_err + rot_err
+
+__all__ = [
+    "translation_error_mm",
+    "rotation_error_deg",
+    "se3_translation_error",
+    "se3_rotation_error_deg",
+]

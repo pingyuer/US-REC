@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from datetime import datetime
 from typing import Any, Dict, Optional
 
 import torch
@@ -13,6 +14,11 @@ from omegaconf import OmegaConf
 from .base_hook import Hook
 from .registry import register_hook
 from utils.loggers import BaseExperimentLogger, MLflowExperimentLogger, NoOpExperimentLogger
+
+
+def _ensure_resolvers() -> None:
+    if not OmegaConf.has_resolver("now"):
+        OmegaConf.register_new_resolver("now", lambda fmt: datetime.now().strftime(fmt))
 
 
 def _flatten_config(cfg: Any) -> Dict[str, str]:
@@ -31,6 +37,7 @@ def _flatten_config(cfg: Any) -> Dict[str, str]:
         return entries
 
     if OmegaConf.is_config(cfg):
+        _ensure_resolvers()
         container = OmegaConf.to_container(cfg, resolve=True)
     elif isinstance(cfg, dict):
         container = cfg
@@ -55,6 +62,24 @@ def _get_git_hash() -> Optional[str]:
 def _safe_state_dict(model: torch.nn.Module) -> Dict[str, torch.Tensor]:
     return model.module.state_dict() if hasattr(model, "module") else model.state_dict()
 
+def _resolve_run_name(template: Optional[str], cfg: Any) -> Optional[str]:
+    if not template:
+        return template
+    resolved = template
+    if "${now:" in resolved:
+        while "${now:" in resolved:
+            start = resolved.find("${now:")
+            end = resolved.find("}", start)
+            if end == -1:
+                break
+            fmt = resolved[start + len("${now:") : end]
+            resolved = resolved[:start] + datetime.now().strftime(fmt) + resolved[end + 1 :]
+    if "${model.name}" in resolved:
+        model_name = OmegaConf.select(cfg, "model.name") if OmegaConf.is_config(cfg) else None
+        if model_name is not None:
+            resolved = resolved.replace("${model.name}", str(model_name))
+    return resolved
+
 
 @register_hook("MLflowHook")
 class MLflowHook(Hook):
@@ -77,14 +102,18 @@ class MLflowHook(Hook):
         mlflow_cfg = OmegaConf.select(cfg, "logging.mlflow")
         if mlflow_cfg is None and hasattr(cfg, "get"):
             mlflow_cfg = cfg.get("mlflow")
-        mlflow_cfg = OmegaConf.to_container(mlflow_cfg, resolve=True) if mlflow_cfg else {}
+        if mlflow_cfg:
+            _ensure_resolvers()
+            mlflow_cfg = OmegaConf.to_container(mlflow_cfg, resolve=True)
+        else:
+            mlflow_cfg = {}
         enabled = bool(mlflow_cfg.get("enabled", bool(mlflow_cfg)))
         if not enabled:
             return NoOpExperimentLogger()
         try:
             return MLflowExperimentLogger(
-                tracking_uri=mlflow_cfg.get("tracking_uri"),
-                experiment_name=mlflow_cfg.get("experiment_name"),
+                tracking_uri=str(mlflow_cfg.get("tracking_uri") or ""),
+                experiment_name=str(mlflow_cfg.get("experiment_name") or ""),
                 artifact_subdir=mlflow_cfg.get("artifact_subdir", "artifacts"),
                 log_system_metrics=bool(mlflow_cfg.get("log_system_metrics", False)),
                 register_model=bool(mlflow_cfg.get("register_model", False)),
@@ -113,10 +142,28 @@ class MLflowHook(Hook):
         mlflow_cfg = OmegaConf.select(self.cfg, "logging.mlflow")
         if mlflow_cfg is None and hasattr(self.cfg, "get"):
             mlflow_cfg = self.cfg.get("mlflow")
-        mlflow_cfg = OmegaConf.to_container(mlflow_cfg, resolve=True) if mlflow_cfg else {}
-        run_name = mlflow_cfg.get("run_name")
+        if mlflow_cfg:
+            _ensure_resolvers()
+            mlflow_cfg = OmegaConf.to_container(mlflow_cfg, resolve=True)
+        else:
+            mlflow_cfg = {}
+        run_name = _resolve_run_name(mlflow_cfg.get("run_name"), self.cfg)
         tags = mlflow_cfg.get("tags") or {}
-        self.logger.start_run(run_name=run_name, tags=tags)
+        try:
+            print(
+                "[mlflow] resolved config summary:",
+                f"tracking_uri={getattr(self.logger, 'tracking_uri', None)}",
+                f"experiment_name={getattr(self.logger, 'experiment_name', None)}",
+                f"run_name={run_name}",
+            )
+            self.logger.start_run(run_name=run_name, tags=tags)
+        except ValueError:
+            raise
+        except Exception:
+            if not self._warned:
+                print("[mlflow] disabled (start_run failed)")
+                self._warned = True
+            self.logger = NoOpExperimentLogger()
 
         params = _flatten_config(self.cfg)
         params["command"] = " ".join(sys.argv)
@@ -127,7 +174,13 @@ class MLflowHook(Hook):
         if device is not None:
             params["device"] = str(device)
             params["cuda_available"] = str(torch.cuda.is_available())
+        params["metric_spec"] = (
+            "translation_error_mm,rotation_error_deg,se3_trans_mm,se3_rot_deg,"
+            "endpoint_rpe_mm,endpoint_rpe_deg,end_to_start_rpe_mm,end_to_start_rpe_deg,"
+            "GPE_mm,GLE_mm,LPE_mm,LLE_mm,runtime_s_per_scan,final_score"
+        )
         self.logger.log_params(params)
+        self._log_calib_summary(trainer)
 
     def after_step(self, trainer, log_buffer=None):
         if not log_buffer:
@@ -238,3 +291,25 @@ class MLflowHook(Hook):
         with out_path.open("w", encoding="utf-8") as f:
             json.dump(rows, f, ensure_ascii=False, indent=2)
         self.logger.log_artifact(str(out_path), artifact_path="metrics")
+
+    def _log_calib_summary(self, trainer) -> None:
+        tform_calib = getattr(trainer, "tform_calib", None)
+        tform_scale = getattr(trainer, "tform_calib_scale", None)
+        if tform_calib is None:
+            return
+        ctx = getattr(trainer, "ctx", None)
+        run_dir = getattr(ctx, "run_dir", None) if ctx is not None else None
+        if not run_dir:
+            return
+        out_dir = Path(run_dir) / "calib"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "tform_calib": torch.as_tensor(tform_calib).detach().cpu().tolist(),
+            "tform_calib_scale": torch.as_tensor(tform_scale).detach().cpu().tolist()
+            if tform_scale is not None
+            else None,
+        }
+        out_path = out_dir / "calib_summary.json"
+        with out_path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        self.logger.log_artifact(str(out_path), artifact_path="calib")

@@ -91,7 +91,7 @@ class TUSRecS3Iterable(torch.utils.data.IterableDataset):
             return 0, 1
         return worker_info.id, worker_info.num_workers
 
-    def _list_slices(self) -> List[SliceInfo]:
+    def _list_slices(self, client=None) -> List[SliceInfo]:
         frame_prefix = "/".join([p for p in [self.prefix, self.frame_dir] if p])
         keys = s3_io.list_keys(
             bucket=self.bucket,
@@ -100,6 +100,7 @@ class TUSRecS3Iterable(torch.utils.data.IterableDataset):
             endpoint=self.endpoint,
             force_path_style=self.force_path_style,
             max_keys=self.max_keys,
+            client=client,
         )
         slices: List[SliceInfo] = []
         for key in sorted(keys):
@@ -145,13 +146,14 @@ class TUSRecS3Iterable(torch.utils.data.IterableDataset):
             rng.shuffle(indices)
         return indices
 
-    def _load_slice(self, info: SliceInfo) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _load_slice(self, info: SliceInfo, client=None) -> Tuple[torch.Tensor, torch.Tensor]:
         payload = s3_io.get_object(
             bucket=self.bucket,
             key=info.frame_key,
             region=self.region,
             endpoint=self.endpoint,
             force_path_style=self.force_path_style,
+            client=client,
         )
         frames, tforms = h5_io.decode_frames_tforms(payload)
         if info.tform_key != info.frame_key:
@@ -161,6 +163,7 @@ class TUSRecS3Iterable(torch.utils.data.IterableDataset):
                 region=self.region,
                 endpoint=self.endpoint,
                 force_path_style=self.force_path_style,
+                client=client,
             )
             tforms = h5_io.decode_tforms_only(payload)
         frames_t = torch.from_numpy(frames)
@@ -168,12 +171,12 @@ class TUSRecS3Iterable(torch.utils.data.IterableDataset):
         return frames_t, tforms_t
 
     def _iter_loaded_slices(
-        self, slice_infos: List[SliceInfo]
+        self, slice_infos: List[SliceInfo], client=None
     ) -> Iterable[Tuple[SliceInfo, torch.Tensor, torch.Tensor]]:
         if self.prefetch_slices <= 0:
             for info in slice_infos:
                 try:
-                    frames_t, tforms_t = self._load_slice(info)
+                    frames_t, tforms_t = self._load_slice(info, client=client)
                 except Exception:
                     continue
                 yield info, frames_t, tforms_t
@@ -186,7 +189,7 @@ class TUSRecS3Iterable(torch.utils.data.IterableDataset):
                 info = next(info_iter, None)
                 if info is None:
                     break
-                futures[executor.submit(self._load_slice, info)] = info
+                futures[executor.submit(self._load_slice, info, client=client)] = info
             while futures:
                 done, _ = concurrent.futures.wait(
                     futures,
@@ -202,7 +205,7 @@ class TUSRecS3Iterable(torch.utils.data.IterableDataset):
                     next_info = next(info_iter, None)
                     if next_info is not None:
                         try:
-                            futures[executor.submit(self._load_slice, next_info)] = next_info
+                            futures[executor.submit(self._load_slice, next_info, client=client)] = next_info
                         except RuntimeError:
                             break
                     if frames_t is None:
@@ -211,6 +214,7 @@ class TUSRecS3Iterable(torch.utils.data.IterableDataset):
 
     def _iter_samples_for_slice(
         self,
+        info: SliceInfo,
         frames_t: torch.Tensor,
         tforms_t: torch.Tensor,
         rng: random.Random,
@@ -221,54 +225,86 @@ class TUSRecS3Iterable(torch.utils.data.IterableDataset):
             return
         indices = self._slice_pair_indices(num_pairs, rng)
         for idx in indices:
+            # Materialize pair tensors so buffered samples don't retain the
+            # storage of the full slice tensors in memory.
+            frames_pair = frames_t[idx : idx + 2].clone()
+            tforms_pair = tforms_t[idx : idx + 2].clone()
+            tforms_inv_pair = tforms_inv[idx : idx + 2].clone()
             yield {
-                "frames": frames_t[idx : idx + 2],
-                "tforms": tforms_t[idx : idx + 2],
-                "tforms_inv": tforms_inv[idx : idx + 2],
+                "frames": frames_pair,
+                "tforms": tforms_pair,
+                "tforms_inv": tforms_inv_pair,
+                "meta": {
+                    "scan_id": f"{info.subject}/{info.scan_name}",
+                    "scan_name": info.scan_name,
+                    "subject": info.subject,
+                },
             }
 
-    def _buffered_iter(self, slice_infos: List[SliceInfo], producer_rng: random.Random):
+    def _buffered_iter(self, slice_infos: List[SliceInfo], producer_rng: random.Random, client=None):
         buffer: List[dict] = []
         lock = threading.Lock()
         not_empty = threading.Condition(lock)
         not_full = threading.Condition(lock)
         done = {"value": False}
+        stop = {"value": False}
 
-        def buffer_put(sample: dict) -> None:
+        def buffer_put(sample: dict) -> bool:
+            if stop["value"]:
+                return False
             if self.shuffle_buffer_size <= 0:
                 buffer.append(sample)
-                return
+                return True
             with not_full:
-                while len(buffer) >= self.shuffle_buffer_size:
+                while len(buffer) >= self.shuffle_buffer_size and not stop["value"]:
                     not_full.wait()
+                if stop["value"]:
+                    return False
                 buffer.append(sample)
                 not_empty.notify()
+                return True
 
         def producer() -> None:
             try:
-                for _info, frames_t, tforms_t in self._iter_loaded_slices(slice_infos):
-                    for sample in self._iter_samples_for_slice(frames_t, tforms_t, producer_rng):
-                        buffer_put(sample)
+                for info, frames_t, tforms_t in self._iter_loaded_slices(slice_infos, client=client):
+                    if stop["value"]:
+                        break
+                    for sample in self._iter_samples_for_slice(info, frames_t, tforms_t, producer_rng):
+                        if stop["value"]:
+                            break
+                        if not buffer_put(sample):
+                            break
+                    if stop["value"]:
+                        break
             finally:
                 with not_empty:
                     done["value"] = True
                     not_empty.notify_all()
+                with not_full:
+                    not_full.notify_all()
 
         thread = threading.Thread(target=producer, daemon=True)
         thread.start()
 
-        while True:
+        try:
+            while True:
+                with not_empty:
+                    while not buffer and not done["value"]:
+                        not_empty.wait()
+                    if not buffer and done["value"]:
+                        break
+                    idx = producer_rng.randrange(len(buffer))
+                    sample = buffer.pop(idx)
+                    not_full.notify()
+                yield sample
+        finally:
+            with not_full:
+                stop["value"] = True
+                not_full.notify_all()
             with not_empty:
-                while not buffer and not done["value"]:
-                    not_empty.wait()
-                if not buffer and done["value"]:
-                    break
-                idx = producer_rng.randrange(len(buffer))
-                sample = buffer.pop(idx)
-                not_full.notify()
-            yield sample
-
-        thread.join(timeout=1)
+                done["value"] = True
+                not_empty.notify_all()
+            thread.join(timeout=1)
 
     def __iter__(self):
         ddp_rank, ddp_world = self._resolve_rank_info()
@@ -276,8 +312,15 @@ class TUSRecS3Iterable(torch.utils.data.IterableDataset):
         global_rank = ddp_rank * num_workers + worker_id
         global_world = ddp_world * num_workers
 
+        # Initialize S3 client once per worker/iterator to reuse connections
+        client = s3_io.create_client(
+            region=self.region,
+            endpoint=self.endpoint,
+            force_path_style=self.force_path_style,
+        )
+
         global_rng = random.Random(self.seed + self.epoch)
-        slices = self._list_slices()
+        slices = self._list_slices(client=client)
         if self.shuffle_slices:
             global_rng.shuffle(slices)
         slices = slices[global_rank::global_world]
@@ -289,15 +332,15 @@ class TUSRecS3Iterable(torch.utils.data.IterableDataset):
             return iter(())
 
         if self.shuffle_buffer_size <= 0:
-            for _info, frames_t, tforms_t in self._iter_loaded_slices(slices):
-                for sample in self._iter_samples_for_slice(frames_t, tforms_t, producer_rng):
+            for info, frames_t, tforms_t in self._iter_loaded_slices(slices, client=client):
+                for sample in self._iter_samples_for_slice(info, frames_t, tforms_t, producer_rng):
                     if self.pipeline is None:
                         yield sample
                     else:
                         yield self.pipeline(sample)
             return
 
-        for sample in self._buffered_iter(slices, producer_rng):
+        for sample in self._buffered_iter(slices, producer_rng, client=client):
             if self.pipeline is None:
                 yield sample
             else:

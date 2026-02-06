@@ -147,8 +147,8 @@ records:
 # Comment out to run fully offline.
 mlflow:
   enabled: true
-  tracking_uri: ${oc.env:MLFLOW_TRACKING_URI,http://172.16.240.33:5000}
-  experiment_name: ${oc.env:MLFLOW_EXPERIMENT,tui_unet}
+  tracking_uri: ${oc.env:MLFLOW_TRACKING_URI,"http://172.16.240.33:5000"}
+  experiment_name: ${oc.env:MLFLOW_EXPERIMENT,"tui_unet"}
   run_name: null
   tags:
     dataset: tui

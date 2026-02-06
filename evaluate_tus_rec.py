@@ -12,12 +12,15 @@ from typing import Optional
 import numpy as np
 import torch
 
-from metrics import (
-    translation_error,
-    rotation_error,
-    se3_error,
-    cumulative_drift,
-    loop_closure_error,
+from trainers.metrics import (
+    end_to_start_rpe_rotation_deg,
+    end_to_start_rpe_translation_mm,
+    endpoint_rpe_rotation_deg,
+    endpoint_rpe_translation_mm,
+    rotation_error_deg,
+    se3_rotation_error_deg,
+    se3_translation_error,
+    translation_error_mm,
     ddf_rmse,
     ddf_mae,
     volume_ncc,
@@ -60,17 +63,23 @@ def main() -> None:
     pred_T = _ensure_batched(_load_tensor(args.pred).float())
     gt_T = _ensure_batched(_load_tensor(args.gt).float())
 
-    trans_err = translation_error(pred_T[..., :3, 3], gt_T[..., :3, 3]).mean().item()
-    rot_err = rotation_error(pred_T[..., :3, :3], gt_T[..., :3, :3]).mean().item()
-    se3_err = se3_error(pred_T, gt_T).mean().item()
-    drift = cumulative_drift(pred_T, gt_T).mean().item()
-    loop_err = loop_closure_error(pred_T, gt_T).mean().item()
+    trans_err = translation_error_mm(pred_T[..., :3, 3], gt_T[..., :3, 3]).mean().item()
+    rot_err = rotation_error_deg(pred_T[..., :3, :3], gt_T[..., :3, :3]).mean().item()
+    se3_trans = se3_translation_error(pred_T, gt_T).mean().item()
+    se3_rot = se3_rotation_error_deg(pred_T, gt_T).mean().item()
+    drift_t = endpoint_rpe_translation_mm(pred_T, gt_T).mean().item()
+    drift_r = endpoint_rpe_rotation_deg(pred_T, gt_T).mean().item()
+    loop_t = end_to_start_rpe_translation_mm(pred_T, gt_T).mean().item()
+    loop_r = end_to_start_rpe_rotation_deg(pred_T, gt_T).mean().item()
 
-    _print_row("translation_error", trans_err)
-    _print_row("rotation_error", rot_err)
-    _print_row("se3_error", se3_err)
-    _print_row("cumulative_drift", drift)
-    _print_row("loop_closure_error", loop_err)
+    _print_row("translation_error_mm", trans_err)
+    _print_row("rotation_error_deg", rot_err)
+    _print_row("se3_trans_mm", se3_trans)
+    _print_row("se3_rot_deg", se3_rot)
+    _print_row("endpoint_rpe_mm", drift_t)
+    _print_row("endpoint_rpe_deg", drift_r)
+    _print_row("end_to_start_rpe_mm", loop_t)
+    _print_row("end_to_start_rpe_deg", loop_r)
 
     if args.pred_ddf and args.gt_ddf:
         pred_ddf = _load_tensor(args.pred_ddf).float()

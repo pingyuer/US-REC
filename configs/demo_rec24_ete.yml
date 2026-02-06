@@ -87,7 +87,7 @@ loss:
 trainer:
   name: trainers.rec_trainer.Train_Rec_Reg_Model
   max_epochs: 5
-  max_steps: null
+  max_steps: 2000
   log_interval: 500
   validate_every: 1
   save_interval: 100
@@ -107,9 +107,9 @@ trainer:
 logging:
   mlflow:
     enabled: true
-    tracking_uri: ${oc.env:MLFLOW_TRACKING_URI,http://172.16.240.33:5000}
-    experiment_name: ${oc.env:MLFLOW_EXPERIMENT_NAME,rec}
-    run_name: ${oc.env:MLFLOW_RUN_NAME,${now:%Y%m%d_%H%M%S}_${model.name}}
+    tracking_uri: ${oc.env:MLFLOW_TRACKING_URI,"http://172.16.240.33:5000"}
+    experiment_name: ${oc.env:MLFLOW_EXPERIMENT_NAME,"rec"}
+    run_name: ${oc.env:MLFLOW_RUN_NAME,"${now:%Y%m%d_%H%M%S}_${model.name}"}
     tags:
       dataset: tus_rec24
       model: efficientnet_b1

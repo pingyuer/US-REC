@@ -35,9 +35,27 @@ class MLflowExperimentLogger(BaseExperimentLogger):
         self.log_model_format = str(log_model_format)
         self._disabled = mlflow is None
 
+    def _validate_value(self, name: str, value: Optional[str]) -> None:
+        if value is None:
+            return
+        if "${" in value or "oc.env" in value:
+            raise ValueError(f"MLflow config '{name}' not resolved: {value}")
+
+    def _validate_tracking_uri(self, tracking_uri: str) -> None:
+        if not tracking_uri:
+            raise ValueError("MLflow tracking_uri is empty")
+        if "${" in tracking_uri or "oc.env" in tracking_uri:
+            raise ValueError(f"MLflow tracking_uri not resolved: {tracking_uri}")
+        if not (tracking_uri.startswith("http://") or tracking_uri.startswith("https://")):
+            raise ValueError(f"MLflow tracking_uri must be http(s): {tracking_uri}")
+
     def start_run(self, *, run_name: Optional[str] = None, tags: Optional[Dict[str, str]] = None) -> None:
         if self._disabled:
             return
+        self._validate_tracking_uri(str(self.tracking_uri))
+        self._validate_value("experiment_name", str(self.experiment_name))
+        if run_name is not None:
+            self._validate_value("run_name", str(run_name))
         try:
             if self.tracking_uri:
                 mlflow.set_tracking_uri(self.tracking_uri)

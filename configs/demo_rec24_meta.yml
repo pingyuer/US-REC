@@ -107,9 +107,9 @@ trainer:
 logging:
   mlflow:
     enabled: true
-    tracking_uri: ${oc.env:MLFLOW_TRACKING_URI,http://172.16.240.33:5000}
-    experiment_name: ${oc.env:MLFLOW_EXPERIMENT_NAME,rec}
-    run_name: ${oc.env:MLFLOW_RUN_NAME,${now:%Y%m%d_%H%M%S}_${model.name}}
+    tracking_uri: ${oc.env:MLFLOW_TRACKING_URI,"http://172.16.240.33:5000"}
+    experiment_name: ${oc.env:MLFLOW_EXPERIMENT_NAME,"rec"}
+    run_name: ${oc.env:MLFLOW_RUN_NAME,"${now:%Y%m%d_%H%M%S}_${model.name}"}
     tags:
       dataset: tus_rec24
       model: efficientnet_b1

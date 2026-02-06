@@ -45,11 +45,14 @@ from trainers.utils.bn_utils import switch_off_batch_norm
 from utils.rec_ops import compute_dimention, data_pairs_adjacent, ConvPose
 from trainers.rec_evaluator import RecEvaluator
 from trainers.metrics import (
-    translation_error,
-    rotation_error,
-    se3_error,
-    cumulative_drift,
-    loop_closure_error,
+    end_to_start_rpe_rotation_deg,
+    end_to_start_rpe_translation_mm,
+    endpoint_rpe_rotation_deg,
+    endpoint_rpe_translation_mm,
+    rotation_error_deg,
+    se3_rotation_error_deg,
+    se3_translation_error,
+    translation_error_mm,
     volume_ncc,
     volume_ssim,
     volume_dice,
@@ -267,17 +270,25 @@ class Train_Rec_Reg_Model:
             rigid_only=not self.nonrigid_enabled,
         )
         metrics = {}
-        trans_err = translation_error(pred_transfs[..., :3, 3], tforms_each_frame2frame0[..., :3, 3])
-        rot_err = rotation_error(pred_transfs[..., :3, :3], tforms_each_frame2frame0[..., :3, :3])
-        se3_err = se3_error(pred_transfs, tforms_each_frame2frame0)
-        metrics["translation_error"] = trans_err.mean().item()
-        metrics["rotation_error"] = rot_err.mean().item()
-        metrics["se3_error"] = se3_err.mean().item()
+        trans_err = translation_error_mm(
+            pred_transfs[..., :3, 3], tforms_each_frame2frame0[..., :3, 3]
+        )
+        rot_err = rotation_error_deg(pred_transfs[..., :3, :3], tforms_each_frame2frame0[..., :3, :3])
+        se3_trans = se3_translation_error(pred_transfs, tforms_each_frame2frame0)
+        se3_rot = se3_rotation_error_deg(pred_transfs, tforms_each_frame2frame0)
+        metrics["translation_error_mm"] = trans_err.mean().item()
+        metrics["rotation_error_deg"] = rot_err.mean().item()
+        metrics["se3_trans_mm"] = se3_trans.mean().item()
+        metrics["se3_rot_deg"] = se3_rot.mean().item()
 
-        drift = cumulative_drift(pred_transfs, tforms_each_frame2frame0)
-        loop_err = loop_closure_error(pred_transfs, tforms_each_frame2frame0)
-        metrics["cumulative_drift"] = float(drift.mean().item())
-        metrics["loop_closure_error"] = float(loop_err.mean().item())
+        drift_t = endpoint_rpe_translation_mm(pred_transfs, tforms_each_frame2frame0)
+        drift_r = endpoint_rpe_rotation_deg(pred_transfs, tforms_each_frame2frame0)
+        loop_t = end_to_start_rpe_translation_mm(pred_transfs, tforms_each_frame2frame0)
+        loop_r = end_to_start_rpe_rotation_deg(pred_transfs, tforms_each_frame2frame0)
+        metrics["endpoint_rpe_mm"] = float(drift_t.mean().item())
+        metrics["endpoint_rpe_deg"] = float(drift_r.mean().item())
+        metrics["end_to_start_rpe_mm"] = float(loop_t.mean().item())
+        metrics["end_to_start_rpe_deg"] = float(loop_r.mean().item())
         if extras.get("pred_volume") is not None and extras.get("gt_volume") is not None:
             pred_volume = extras["pred_volume"]
             gt_volume = extras["gt_volume"]

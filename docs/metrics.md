@@ -1,12 +1,12 @@
 # Metrics
 
-This project exposes evaluation metrics in `metrics/` (backed by `trainers/metrics/`).
+This project exposes evaluation metrics in `trainers/metrics/`.
 
 ## What’s available
 
 ### Epoch metrics (recommended)
 
-Use `metrics.ConfusionMatrix` to accumulate per-batch predictions over a full validation epoch and then compute:
+Use `trainers.metrics.ConfusionMatrix` to accumulate per-batch predictions over a full validation epoch and then compute:
 
 - `Accuracy`
 - `mIoU`
@@ -16,44 +16,53 @@ Implementation: `trainers/metrics/segmentation.py` (`ConfusionMatrix`).
 
 ### Functional helpers (legacy / script usage)
 
-- `metrics.iou_score(output, target) -> (iou, dice)` (binary thresholded IoU/Dice)
-- `metrics.edge_f1score(output, target, cls)` (edge-based F1 using OpenCV Canny)
+- `trainers.metrics.iou_score(output, target) -> (iou, dice)` (binary thresholded IoU/Dice)
+- `trainers.metrics.edge_f1score(output, target, cls)` (edge-based F1 using OpenCV Canny)
 
 Implementations:
-- `metrics/functional.py`
-- `metrics/edge.py` (requires `cv2`)
+- `trainers/metrics/functional.py`
+- `trainers/metrics/edge.py` (requires `cv2`)
 
 ### 3) 3D reconstruction/registration metrics
 
 These metrics support freehand reconstruction and registration evaluation:
 
-- `metrics.translation_error(pred_t, gt_t) -> L2 translation error`
-- `metrics.rotation_error(pred_R, gt_R) -> rotation error (degrees)`
-- `metrics.se3_error(pred_T, gt_T) -> combined SE(3) error`
-- `metrics.cumulative_drift(pred_Ts, gt_Ts) -> drift over sequence`
-- `metrics.loop_closure_error(pred_Ts, gt_Ts) -> loop return error`
-- `metrics.ddf_rmse(pred_ddf, gt_ddf)`
-- `metrics.ddf_mae(pred_ddf, gt_ddf)`
-- `metrics.volume_ssim(pred_vol, gt_vol)`
-- `metrics.volume_ncc(pred_vol, gt_vol)`
-- `metrics.volume_dice(pred_vol, gt_vol)`
+- `trainers.metrics.translation_error_mm(pred_t, gt_t) -> L2 translation error`
+- `trainers.metrics.rotation_error_deg(pred_R, gt_R) -> rotation error (degrees)`
+- `trainers.metrics.se3_translation_error(pred_T, gt_T) -> translation-only SE(3) error (mm)`
+- `trainers.metrics.se3_rotation_error_deg(pred_T, gt_T) -> rotation-only SE(3) error (deg)`
+- `trainers.metrics.endpoint_rpe_translation_mm(pred_Ts, gt_Ts) -> endpoint RPE (mm)`
+- `trainers.metrics.endpoint_rpe_rotation_deg(pred_Ts, gt_Ts) -> endpoint RPE (deg)`
+- `trainers.metrics.end_to_start_rpe_translation_mm(pred_Ts, gt_Ts) -> loop return (mm)`
+- `trainers.metrics.end_to_start_rpe_rotation_deg(pred_Ts, gt_Ts) -> loop return (deg)`
+- `trainers.metrics.ddf_rmse(pred_ddf, gt_ddf)`
+- `trainers.metrics.ddf_mae(pred_ddf, gt_ddf)`
+- `trainers.metrics.volume_ssim(pred_vol, gt_vol)`
+- `trainers.metrics.volume_ncc(pred_vol, gt_vol)`
+- `trainers.metrics.volume_dice(pred_vol, gt_vol)`
 
 Example:
 
 ```python
-from metrics import (
-    translation_error,
-    rotation_error,
-    se3_error,
-    cumulative_drift,
+from trainers.metrics import (
+    translation_error_mm,
+    rotation_error_deg,
+    se3_translation_error,
+    se3_rotation_error_deg,
+    endpoint_rpe_translation_mm,
+    endpoint_rpe_rotation_deg,
+    end_to_start_rpe_translation_mm,
+    end_to_start_rpe_rotation_deg,
     ddf_rmse,
     volume_ncc,
 )
 
-trans_err = translation_error(pred_t, gt_t)
-rot_err = rotation_error(pred_R, gt_R)
-se3 = se3_error(pred_T, gt_T)
-drift = cumulative_drift(pred_Ts, gt_Ts)
+trans_err = translation_error_mm(pred_t, gt_t)
+rot_err = rotation_error_deg(pred_R, gt_R)
+se3_t = se3_translation_error(pred_T, gt_T)
+se3_r = se3_rotation_error_deg(pred_T, gt_T)
+drift_t = endpoint_rpe_translation_mm(pred_Ts, gt_Ts)
+drift_r = endpoint_rpe_rotation_deg(pred_Ts, gt_Ts)
 rmse = ddf_rmse(pred_ddf, gt_ddf)
 ncc = volume_ncc(pred_vol, gt_vol)
 ```
@@ -129,3 +138,5 @@ from trainers.metrics import edge_f1score
 
 f1 = edge_f1score(output=logits, target=target, cls=2)
 ```
+loop_t = end_to_start_rpe_translation_mm(pred_Ts, gt_Ts)
+loop_r = end_to_start_rpe_rotation_deg(pred_Ts, gt_Ts)

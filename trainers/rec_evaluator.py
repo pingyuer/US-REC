@@ -6,11 +6,14 @@ import time
 import torch
 
 from trainers.metrics import (
-    translation_error,
-    rotation_error,
-    se3_error,
-    cumulative_drift,
-    loop_closure_error,
+    end_to_start_rpe_rotation_deg,
+    end_to_start_rpe_translation_mm,
+    endpoint_rpe_rotation_deg,
+    endpoint_rpe_translation_mm,
+    rotation_error_deg,
+    se3_rotation_error_deg,
+    se3_translation_error,
+    translation_error_mm,
     volume_ncc,
     volume_ssim,
     volume_dice,
@@ -90,7 +93,6 @@ class RecEvaluator:
 
             start_time = time.perf_counter()
             outputs = model(frames)
-            elapsed = time.perf_counter() - start_time
             pred_transfs = build_pred_transforms(trainer.transform_prediction, outputs, self.device)
             labels, pred_pts = points_from_transforms(
                 img_pro_coord=trainer.img_pro_coord,
@@ -163,17 +165,25 @@ class RecEvaluator:
             loss_count += 1
 
             metrics = {}
-            trans_err = translation_error(pred_transfs[..., :3, 3], tforms_each_frame2frame0[..., :3, 3])
-            rot_err = rotation_error(pred_transfs[..., :3, :3], tforms_each_frame2frame0[..., :3, :3])
-            se3_err = se3_error(pred_transfs, tforms_each_frame2frame0)
-            metrics["translation_error"] = trans_err.mean().item()
-            metrics["rotation_error"] = rot_err.mean().item()
-            metrics["se3_error"] = se3_err.mean().item()
+            trans_err = translation_error_mm(
+                pred_transfs[..., :3, 3], tforms_each_frame2frame0[..., :3, 3]
+            )
+            rot_err = rotation_error_deg(pred_transfs[..., :3, :3], tforms_each_frame2frame0[..., :3, :3])
+            se3_trans = se3_translation_error(pred_transfs, tforms_each_frame2frame0)
+            se3_rot = se3_rotation_error_deg(pred_transfs, tforms_each_frame2frame0)
+            metrics["translation_error_mm"] = float(trans_err.mean().item())
+            metrics["rotation_error_deg"] = float(rot_err.mean().item())
+            metrics["se3_trans_mm"] = float(se3_trans.mean().item())
+            metrics["se3_rot_deg"] = float(se3_rot.mean().item())
 
-            drift = cumulative_drift(pred_transfs, tforms_each_frame2frame0)
-            loop_err = loop_closure_error(pred_transfs, tforms_each_frame2frame0)
-            metrics["cumulative_drift"] = float(drift.mean().item())
-            metrics["loop_closure_error"] = float(loop_err.mean().item())
+            drift_t = endpoint_rpe_translation_mm(pred_transfs, tforms_each_frame2frame0)
+            drift_r = endpoint_rpe_rotation_deg(pred_transfs, tforms_each_frame2frame0)
+            loop_t = end_to_start_rpe_translation_mm(pred_transfs, tforms_each_frame2frame0)
+            loop_r = end_to_start_rpe_rotation_deg(pred_transfs, tforms_each_frame2frame0)
+            metrics["endpoint_rpe_mm"] = float(drift_t.mean().item())
+            metrics["endpoint_rpe_deg"] = float(drift_r.mean().item())
+            metrics["end_to_start_rpe_mm"] = float(loop_t.mean().item())
+            metrics["end_to_start_rpe_deg"] = float(loop_r.mean().item())
 
             if extras.get("pred_volume") is not None and extras.get("gt_volume") is not None:
                 pred_volume = extras["pred_volume"]
@@ -183,25 +193,37 @@ class RecEvaluator:
                 metrics["volume_dice"] = float(volume_dice(pred_volume, gt_volume).mean().item())
 
             batch_size = int(frames.shape[0]) if frames.ndim >= 4 else 1
-            runtime_per_scan = elapsed / max(batch_size, 1)
+            batch_start_index = len(tusrec_rows)
             for idx in range(batch_size):
                 frame_seq = frames[idx] if frames.ndim >= 4 else frames
                 gt_seq = tforms_each_frame2frame0[idx] if tforms_each_frame2frame0.ndim == 4 else tforms_each_frame2frame0
                 pred_seq = pred_transfs[idx] if pred_transfs.ndim == 4 else pred_transfs
                 landmarks = None
-                if isinstance(batch, dict) and "landmarks" in batch:
-                    lm = batch["landmarks"]
-                    if torch.is_tensor(lm):
-                        landmarks = lm[idx] if lm.ndim >= 3 else lm
+                scan_id = None
+                if isinstance(batch, dict):
+                    if "landmarks" in batch:
+                        lm = batch["landmarks"]
+                        if torch.is_tensor(lm):
+                            landmarks = lm[idx] if lm.ndim >= 3 else lm
+                    if "scan_id" in batch:
+                        scan_id = batch["scan_id"][idx] if isinstance(batch["scan_id"], list) else batch["scan_id"]
+                    elif "meta" in batch:
+                        meta = batch["meta"]
+                        if isinstance(meta, list) and idx < len(meta) and isinstance(meta[idx], dict):
+                            scan_id = meta[idx].get("scan_id") or meta[idx].get("scan_name")
+                        elif isinstance(meta, dict):
+                            scan_id = meta.get("scan_id") or meta.get("scan_name")
                 tusrec = compute_tusrec_metrics(
                     frames=frame_seq,
                     gt_transforms=gt_seq,
                     pred_transforms=pred_seq,
-                    calib={"tform_calib": trainer.tform_calib},
+                    calib={
+                        "tform_calib": trainer.tform_calib,
+                        "spacing_mm": getattr(trainer, "tform_calib_scale", None),
+                    },
                     landmarks=landmarks,
-                    runtime_s=runtime_per_scan,
                 )
-                row = {"scan_id": f"sample_{sample_index}"}
+                row = {"scan_id": scan_id or f"sample_{sample_index}"}
                 row.update({k: v for k, v in tusrec.items() if v is not None})
                 tusrec_rows.append(row)
                 for key, value in tusrec.items():
@@ -211,9 +233,46 @@ class RecEvaluator:
                     tusrec_counts[key] = tusrec_counts.get(key, 0) + 1
                 sample_index += 1
 
-            for key, value in metrics.items():
-                metric_sums[key] = metric_sums.get(key, 0.0) + float(value)
-                metric_counts[key] = metric_counts.get(key, 0) + 1
+            elapsed = time.perf_counter() - start_time
+            runtime_per_scan = elapsed / max(batch_size, 1)
+            for row in tusrec_rows[batch_start_index:]:
+                row["runtime_s_per_scan"] = runtime_per_scan
+            tusrec_sums["runtime_s_per_scan"] = tusrec_sums.get("runtime_s_per_scan", 0.0) + float(runtime_per_scan) * batch_size
+            tusrec_counts["runtime_s_per_scan"] = tusrec_counts.get("runtime_s_per_scan", 0) + int(batch_size)
+
+            trans_err_flat = trans_err.reshape(-1)
+            rot_err_flat = rot_err.reshape(-1)
+            se3_trans_flat = se3_trans.reshape(-1)
+            se3_rot_flat = se3_rot.reshape(-1)
+            metric_sums["translation_error_mm"] = metric_sums.get("translation_error_mm", 0.0) + float(trans_err_flat.sum().item())
+            metric_counts["translation_error_mm"] = metric_counts.get("translation_error_mm", 0) + int(trans_err_flat.numel())
+            metric_sums["rotation_error_deg"] = metric_sums.get("rotation_error_deg", 0.0) + float(rot_err_flat.sum().item())
+            metric_counts["rotation_error_deg"] = metric_counts.get("rotation_error_deg", 0) + int(rot_err_flat.numel())
+            metric_sums["se3_trans_mm"] = metric_sums.get("se3_trans_mm", 0.0) + float(se3_trans_flat.sum().item())
+            metric_counts["se3_trans_mm"] = metric_counts.get("se3_trans_mm", 0) + int(se3_trans_flat.numel())
+            metric_sums["se3_rot_deg"] = metric_sums.get("se3_rot_deg", 0.0) + float(se3_rot_flat.sum().item())
+            metric_counts["se3_rot_deg"] = metric_counts.get("se3_rot_deg", 0) + int(se3_rot_flat.numel())
+            metric_sums["endpoint_rpe_mm"] = metric_sums.get("endpoint_rpe_mm", 0.0) + float(drift_t.sum().item())
+            metric_counts["endpoint_rpe_mm"] = metric_counts.get("endpoint_rpe_mm", 0) + int(drift_t.numel())
+            metric_sums["endpoint_rpe_deg"] = metric_sums.get("endpoint_rpe_deg", 0.0) + float(drift_r.sum().item())
+            metric_counts["endpoint_rpe_deg"] = metric_counts.get("endpoint_rpe_deg", 0) + int(drift_r.numel())
+            metric_sums["end_to_start_rpe_mm"] = metric_sums.get("end_to_start_rpe_mm", 0.0) + float(loop_t.sum().item())
+            metric_counts["end_to_start_rpe_mm"] = metric_counts.get("end_to_start_rpe_mm", 0) + int(loop_t.numel())
+            metric_sums["end_to_start_rpe_deg"] = metric_sums.get("end_to_start_rpe_deg", 0.0) + float(loop_r.sum().item())
+            metric_counts["end_to_start_rpe_deg"] = metric_counts.get("end_to_start_rpe_deg", 0) + int(loop_r.numel())
+
+            if extras.get("pred_volume") is not None and extras.get("gt_volume") is not None:
+                pred_volume = extras["pred_volume"]
+                gt_volume = extras["gt_volume"]
+                vol_ncc = float(volume_ncc(pred_volume, gt_volume).mean().item())
+                vol_ssim = float(volume_ssim(pred_volume, gt_volume).mean().item())
+                vol_dice = float(volume_dice(pred_volume, gt_volume).mean().item())
+                metric_sums["volume_ncc"] = metric_sums.get("volume_ncc", 0.0) + vol_ncc
+                metric_counts["volume_ncc"] = metric_counts.get("volume_ncc", 0) + 1
+                metric_sums["volume_ssim"] = metric_sums.get("volume_ssim", 0.0) + vol_ssim
+                metric_counts["volume_ssim"] = metric_counts.get("volume_ssim", 0) + 1
+                metric_sums["volume_dice"] = metric_sums.get("volume_dice", 0.0) + vol_dice
+                metric_counts["volume_dice"] = metric_counts.get("volume_dice", 0) + 1
 
             if callbacks:
                 dataset = getattr(loader, "dataset", None)

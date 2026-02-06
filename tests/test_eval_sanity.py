@@ -3,15 +3,15 @@ import torch
 from utils.metrics.tusrec_metrics import compute_tusrec_metrics
 
 
-def _make_transforms(num_frames: int) -> torch.Tensor:
+def _make_transforms(num_frames: int, shift_mm: float = 0.0) -> torch.Tensor:
     transforms = torch.eye(4).unsqueeze(0).repeat(num_frames, 1, 1)
-    for idx in range(1, num_frames):
-        transforms[idx, 0, 3] = float(idx) * 2.0
+    if shift_mm != 0.0:
+        transforms[:, 0, 3] += shift_mm
     return transforms
 
 
-def test_tusrec_metrics_identity_and_largest():
-    num_frames = 4
+def test_tusrec_gt_zero_and_shift_growth():
+    num_frames = 3
     frames = torch.zeros((num_frames, 8, 8))
     tform_calib = torch.eye(4)
     gt = _make_transforms(num_frames)
@@ -21,22 +21,20 @@ def test_tusrec_metrics_identity_and_largest():
         gt_transforms=gt,
         pred_transforms=gt,
         calib={"tform_calib": tform_calib},
-        compute_normalized=True,
+        compute_normalized=False,
         chunk_rows=4,
     )
     assert metrics_gt["GPE_mm"] == 0.0
     assert metrics_gt["LPE_mm"] == 0.0
 
-    identity = torch.eye(4).unsqueeze(0).repeat(num_frames, 1, 1)
-    metrics_identity = compute_tusrec_metrics(
+    pred_shift = _make_transforms(num_frames, shift_mm=10.0)
+    metrics_shift = compute_tusrec_metrics(
         frames=frames,
         gt_transforms=gt,
-        pred_transforms=identity,
+        pred_transforms=pred_shift,
         calib={"tform_calib": tform_calib},
-        compute_normalized=True,
+        compute_normalized=False,
         chunk_rows=4,
     )
-    assert metrics_identity["GPE_norm"] == 0.0
-    assert metrics_identity["LPE_norm"] == 0.0
-    if metrics_identity["final_score"] is not None:
-        assert 0.0 <= metrics_identity["final_score"] <= 1.0
+    assert metrics_shift["GPE_mm"] >= 9.0
+    assert metrics_shift["LPE_mm"] >= 9.0

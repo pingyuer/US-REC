@@ -12,7 +12,7 @@
 - Params: flattened config + CLI command + git hash (if available) + device info.
 - Metrics:
   - Train: loss, lr.
-  - Val: loss + pose-space metrics + TUS-REC metrics (GPE/GLE/LPE/LLE + normalized + final_score).
+  - Val: loss + pose-space metrics + TUS-REC metrics (GPE_mm/GLE_mm/LPE_mm/LLE_mm + normalized + final_score + runtime_s_per_scan).
 - Artifacts:
   - `checkpoints/best/best_<metric>.pt`
   - `checkpoints/last/last.pt`
@@ -22,8 +22,8 @@
 ## TUS-REC metric definitions
 - Global: frame `i -> 0` reconstruction error (i>0).
 - Local: frame `i -> i-1` reconstruction error (i>0).
-- Pixel: mean 3D Euclidean error over all pixels.
-- Landmark: mean 3D Euclidean error over landmarks (if provided).
+- Pixel: mean 3D Euclidean error over all pixels (mm).
+- Landmark: mean 3D Euclidean error over landmarks (mm, if provided).
 - Normalization:
   - `largest_*` uses identity prediction for the same scan.
   - `metric_norm = (metric - largest) / (0 - largest)`.

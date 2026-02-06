@@ -120,9 +120,9 @@ trainer:
   save_interval: 50
 
 mlflow:
-  tracking_uri: ${oc.env:MLFLOW_TRACKING_URI,http://172.16.240.33:5000}
-  experiment_name: ${oc.env:MLFLOW_EXPERIMENT_NAME,tui_unet}
-  run_name: ${oc.env:MLFLOW_RUN_NAME,null}
+  tracking_uri: ${oc.env:MLFLOW_TRACKING_URI,"http://172.16.240.33:5000"}
+  experiment_name: ${oc.env:MLFLOW_EXPERIMENT_NAME,"tui_unet"}
+  run_name: ${oc.env:MLFLOW_RUN_NAME,"${now:%Y%m%d_%H%M%S}_${model.name}"}
   tags:
     dataset: tui
     model: unet
