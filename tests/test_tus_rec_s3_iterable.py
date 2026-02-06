@@ -71,6 +71,7 @@ def test_basic_iteration(monkeypatch):
     assert set(samples[0].keys()) >= {"frames", "tforms", "tforms_inv"}
     assert samples[0]["frames"].shape[0] == 2
     assert samples[0]["tforms"].shape[-2:] == (4, 4)
+    assert int(samples[0]["meta"]["frame_idx1"]) - int(samples[0]["meta"]["frame_idx0"]) == 1
 
 
 def test_ddp_worker_sharding_disjoint(monkeypatch):
@@ -144,9 +145,9 @@ def test_prefetch_slices_cache_reuse(monkeypatch):
     ds = _make_dataset(prefetch_slices=2, shuffle_pairs=False)
     load_calls = {"count": 0}
 
-    def _load_slice(info):
+    def _load_slice(info, client=None):
         load_calls["count"] += 1
-        return TUSRecS3Iterable._load_slice(ds, info)
+        return TUSRecS3Iterable._load_slice(ds, info, client=client)
 
     monkeypatch.setattr(ds, "_load_slice", _load_slice)
     samples = list(ds)
@@ -220,10 +221,10 @@ def test_error_resilience_skips_failed_slice(monkeypatch):
 
     ds = _make_dataset(shuffle_pairs=False)
 
-    def _load_slice(info):
+    def _load_slice(info, client=None):
         if info.scan_name == "scan_b":
             raise RuntimeError("boom")
-        return TUSRecS3Iterable._load_slice(ds, info)
+        return TUSRecS3Iterable._load_slice(ds, info, client=client)
 
     monkeypatch.setattr(ds, "_load_slice", _load_slice)
     samples = list(ds)

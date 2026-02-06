@@ -33,28 +33,30 @@ def compute_loss(
     loss1 = criterion(pred_pts, labels)
     dist = ((pred_pts - labels) ** 2).sum(dim=2).sqrt().mean()
     wrap_dist = torch.tensor(0.0, device=device)
-    loss2 = loss1
+    loss2 = torch.tensor(0.0, device=device)
     ddf = None
     gt_volume = None
     pred_volume = None
+    wrap_enabled = False
     non_rigid_loss_types = {"reg", "rec_reg", "wraped", "rec_volume", "rec_volume10000", "volume_only"}
 
     if rigid_only and loss_type in non_rigid_loss_types:
         # VoxelMorph / non-rigid registration is intentionally disabled in rigid-only mode.
         loss = loss1
-        loss2 = torch.tensor(0.0, device=device)
-        extras = {}
+        extras = {"wrap_enabled": False}
         return loss, loss1, loss2, dist, wrap_dist, extras
 
     if loss_type == "MSE_points":
         loss = loss1
-        loss2 = loss
+        loss2 = torch.tensor(0.0, device=device)
     elif loss_type == "Plane_norm":
         normal_gt = compute_plane_normal(labels)
         normal_np = compute_plane_normal(pred_pts)
         cos_value = angle_between_planes(normal_gt, normal_np)
         loss = loss1 - sum(sum(cos_value))
+        loss2 = torch.tensor(0.0, device=device)
     elif loss_type in {"reg", "rec_reg", "wraped"}:
+        wrap_enabled = True
         gt_volume, pred_volume, warped, ddf = scatter_pts_registration(labels, pred_pts, frames, step)
         if ddf_dirc == "Move" and conv_coords == "optimised_coord":
             wrap_mseloss, wrap_dist, _ = wrapped_pred_dist_fn(
@@ -93,7 +95,7 @@ def compute_loss(
     else:
         loss = loss1
 
-    extras = {}
+    extras = {"wrap_enabled": bool(wrap_enabled)}
     if loss_type in {"reg", "rec_reg", "wraped"}:
         extras["ddf"] = ddf
     if loss_type in {"rec_volume", "rec_volume10000", "volume_only"}:

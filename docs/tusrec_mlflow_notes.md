@@ -12,7 +12,7 @@
 - Params: flattened config + CLI command + git hash (if available) + device info.
 - Metrics:
   - Train: loss, lr.
-  - Val: loss + pose-space metrics + TUS-REC metrics (GPE_mm/GLE_mm/LPE_mm/LLE_mm + normalized + final_score + runtime_s_per_scan).
+  - Val: loss + pose-space metrics + TUS-REC metrics (GPE_mm/GLE_mm/LPE_mm/LLE_mm + score fields + final_score + runtime fields).
 - Artifacts:
   - `checkpoints/best/best_<metric>.pt`
   - `checkpoints/last/last.pt`
@@ -24,10 +24,10 @@
 - Local: frame `i -> i-1` reconstruction error (i>0).
 - Pixel: mean 3D Euclidean error over all pixels (mm).
 - Landmark: mean 3D Euclidean error over landmarks (mm, if provided).
-- Normalization:
+- Score:
   - `largest_*` uses identity prediction for the same scan.
-  - `metric_norm = (metric - largest) / (0 - largest)`.
-  - `final_score = 0.25 * (GPE_norm + GLE_norm + LPE_norm + LLE_norm)`.
+  - `metric_score = clamp(1 - metric / (largest + eps), 0, 1)`.
+  - `final_score` is the mean of available score terms.
 
 ## Sanity checks
 1. `pred == gt` → GPE/GLE/LPE/LLE ≈ 0.

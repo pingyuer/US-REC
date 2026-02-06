@@ -176,8 +176,9 @@ class MLflowHook(Hook):
             params["cuda_available"] = str(torch.cuda.is_available())
         params["metric_spec"] = (
             "translation_error_mm,rotation_error_deg,se3_trans_mm,se3_rot_deg,"
-            "endpoint_rpe_mm,endpoint_rpe_deg,end_to_start_rpe_mm,end_to_start_rpe_deg,"
-            "GPE_mm,GLE_mm,LPE_mm,LLE_mm,runtime_s_per_scan,final_score"
+            "endpoint_rpe_mm,endpoint_rpe_deg,end_to_start_rpe_mm,end_to_start_rpe_deg,wrap_dist_enabled,"
+            "GPE_mm,GLE_mm,LPE_mm,LLE_mm,GPE_score,GLE_score,LPE_score,LLE_score,"
+            "runtime_s_per_scan,runtime_forward_s_per_scan,runtime_e2e_s_per_scan,final_score"
         )
         self.logger.log_params(params)
         self._log_calib_summary(trainer)

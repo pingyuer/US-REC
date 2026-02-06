@@ -1,6 +1,6 @@
 import torch
 
-from utils.metrics.tusrec_metrics import compute_tusrec_metrics
+from trainers.metrics import compute_tusrec_metrics
 
 
 def _make_transforms(num_frames: int) -> torch.Tensor:
@@ -21,7 +21,7 @@ def test_tusrec_metrics_identity_and_largest():
         gt_transforms=gt,
         pred_transforms=gt,
         calib={"tform_calib": tform_calib},
-        compute_normalized=True,
+        compute_scores=True,
         chunk_rows=4,
     )
     assert metrics_gt["GPE_mm"] == 0.0
@@ -33,10 +33,10 @@ def test_tusrec_metrics_identity_and_largest():
         gt_transforms=gt,
         pred_transforms=identity,
         calib={"tform_calib": tform_calib},
-        compute_normalized=True,
+        compute_scores=True,
         chunk_rows=4,
     )
-    assert metrics_identity["GPE_norm"] == 0.0
-    assert metrics_identity["LPE_norm"] == 0.0
+    assert metrics_identity["GPE_score"] == 0.0
+    assert metrics_identity["LPE_score"] == 0.0
     if metrics_identity["final_score"] is not None:
         assert 0.0 <= metrics_identity["final_score"] <= 1.0

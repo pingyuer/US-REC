@@ -48,28 +48,40 @@ def type_dim(label_pred_type, num_points=None, num_pairs=1):
 
 def reference_image_points(image_size, density=2):
     """
-    :param image_size: (x, y), used for defining default grid image_points
-    :param density: (x, y), point sample density in each of x and y, default n=2
+    Build image points in pixel coordinates with top-left origin.
+
+    :param image_size: (H, W)
+    :param density: (nH, nW), sampling density along H/W; int -> square grid.
     """
-    if isinstance(density,int):
-        density=(density,density)
+    if isinstance(density, int):
+        density = (density, density)
 
-    # image_points = torch.cartesian_prod(
-    #     torch.linspace(-image_size[0]/2,image_size[0]/2,density[0]),
-    #     torch.linspace(-image_size[1]/2,image_size[1]/2,density[1])
-    #     ).t()  # transpose to 2-by-n
+    h = int(image_size[0])
+    w = int(image_size[1])
+    if h <= 0 or w <= 0:
+        raise ValueError(f"Invalid image_size={image_size}; expected positive (H,W).")
+    dh = int(density[0])
+    dw = int(density[1])
+    if dh <= 0 or dw <= 0:
+        raise ValueError(f"Invalid density={density}; expected positive integers.")
 
-    image_points = torch.cartesian_prod(
-        torch.linspace(0, image_size[0] , density[0]),
-        torch.linspace(0, image_size[1], density[1])
-    ).t()
-    
+    x_vals = torch.linspace(0.0, float(h - 1), dh)
+    y_vals = torch.linspace(0.0, float(w - 1), dw)
+    image_points = torch.cartesian_prod(x_vals, y_vals).t()
+
     image_points = torch.cat([
-        image_points, 
-        torch.zeros(1,image_points.shape[1])*image_size[0]/2,
-        torch.ones(1,image_points.shape[1])
-        ], axis=0)
-    
+        image_points,
+        torch.zeros(1, image_points.shape[1], dtype=image_points.dtype),
+        torch.ones(1, image_points.shape[1], dtype=image_points.dtype)
+    ], axis=0)
+
+    max_x = float(image_points[0].max().item())
+    max_y = float(image_points[1].max().item())
+    if max_x > (h - 1) + 1e-6 or max_y > (w - 1) + 1e-6:
+        raise ValueError(
+            f"reference_image_points out of bounds: max_x={max_x}, max_y={max_y}, "
+            f"expected <= ({h - 1}, {w - 1})"
+        )
     return image_points
 
 
@@ -210,5 +222,4 @@ def load_json(opt,json_fn):
         rmse_intervals_each_scan= {}
 
     return rmse_intervals_each_scan
-
 

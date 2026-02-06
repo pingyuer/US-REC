@@ -4,15 +4,17 @@ from typing import Any, Optional
 import time
 
 import torch
+from omegaconf import OmegaConf
 
 from trainers.metrics import (
+    compute_tusrec_metrics,
     end_to_start_rpe_rotation_deg,
     end_to_start_rpe_translation_mm,
     endpoint_rpe_rotation_deg,
     endpoint_rpe_translation_mm,
     rotation_error_deg,
     se3_rotation_error_deg,
-    se3_translation_error,
+    se3_translation_error_mm,
     translation_error_mm,
     volume_ncc,
     volume_ssim,
@@ -26,7 +28,6 @@ from trainers.utils.forward_utils import (
 )
 from trainers.utils.loss import compute_loss
 from trainers.utils.interp_reg import scatter_pts_interpolation, scatter_pts_registration
-from utils.metrics.tusrec_metrics import compute_tusrec_metrics
 from utils.funcs import wrapped_pred_dist
 
 
@@ -83,6 +84,7 @@ class RecEvaluator:
 
         sample_index = 0
         for batch in loader:
+            batch_start_time = time.perf_counter()
             frames, tforms, tforms_inv = unpack_batch(batch)
             frames = frames.to(self.device)
             tforms = tforms.to(self.device)
@@ -91,7 +93,7 @@ class RecEvaluator:
             tforms_each_frame2frame0 = trainer.transform_label(tforms, tforms_inv)
             frames = frames / 255
 
-            start_time = time.perf_counter()
+            forward_start_time = time.perf_counter()
             outputs = model(frames)
             pred_transfs = build_pred_transforms(trainer.transform_prediction, outputs, self.device)
             labels, pred_pts = points_from_transforms(
@@ -169,7 +171,7 @@ class RecEvaluator:
                 pred_transfs[..., :3, 3], tforms_each_frame2frame0[..., :3, 3]
             )
             rot_err = rotation_error_deg(pred_transfs[..., :3, :3], tforms_each_frame2frame0[..., :3, :3])
-            se3_trans = se3_translation_error(pred_transfs, tforms_each_frame2frame0)
+            se3_trans = se3_translation_error_mm(pred_transfs, tforms_each_frame2frame0)
             se3_rot = se3_rotation_error_deg(pred_transfs, tforms_each_frame2frame0)
             metrics["translation_error_mm"] = float(trans_err.mean().item())
             metrics["rotation_error_deg"] = float(rot_err.mean().item())
@@ -184,6 +186,7 @@ class RecEvaluator:
             metrics["endpoint_rpe_deg"] = float(drift_r.mean().item())
             metrics["end_to_start_rpe_mm"] = float(loop_t.mean().item())
             metrics["end_to_start_rpe_deg"] = float(loop_r.mean().item())
+            metrics["wrap_dist_enabled"] = 1.0 if bool(extras.get("wrap_enabled", False)) else 0.0
 
             if extras.get("pred_volume") is not None and extras.get("gt_volume") is not None:
                 pred_volume = extras["pred_volume"]
@@ -222,6 +225,12 @@ class RecEvaluator:
                         "spacing_mm": getattr(trainer, "tform_calib_scale", None),
                     },
                     landmarks=landmarks,
+                    image_points=trainer.image_points,
+                    enforce_lp_gp_distinct=bool(
+                        OmegaConf.select(cfg, "metrics.tusrec.enforce_lp_gp_distinct")
+                        if OmegaConf.is_config(cfg)
+                        else False
+                    ),
                 )
                 row = {"scan_id": scan_id or f"sample_{sample_index}"}
                 row.update({k: v for k, v in tusrec.items() if v is not None})
@@ -233,12 +242,18 @@ class RecEvaluator:
                     tusrec_counts[key] = tusrec_counts.get(key, 0) + 1
                 sample_index += 1
 
-            elapsed = time.perf_counter() - start_time
-            runtime_per_scan = elapsed / max(batch_size, 1)
+            runtime_forward_per_scan = (time.perf_counter() - forward_start_time) / max(batch_size, 1)
+            runtime_e2e_per_scan = (time.perf_counter() - batch_start_time) / max(batch_size, 1)
             for row in tusrec_rows[batch_start_index:]:
-                row["runtime_s_per_scan"] = runtime_per_scan
-            tusrec_sums["runtime_s_per_scan"] = tusrec_sums.get("runtime_s_per_scan", 0.0) + float(runtime_per_scan) * batch_size
+                row["runtime_s_per_scan"] = runtime_forward_per_scan
+                row["runtime_forward_s_per_scan"] = runtime_forward_per_scan
+                row["runtime_e2e_s_per_scan"] = runtime_e2e_per_scan
+            tusrec_sums["runtime_s_per_scan"] = tusrec_sums.get("runtime_s_per_scan", 0.0) + float(runtime_forward_per_scan) * batch_size
             tusrec_counts["runtime_s_per_scan"] = tusrec_counts.get("runtime_s_per_scan", 0) + int(batch_size)
+            tusrec_sums["runtime_forward_s_per_scan"] = tusrec_sums.get("runtime_forward_s_per_scan", 0.0) + float(runtime_forward_per_scan) * batch_size
+            tusrec_counts["runtime_forward_s_per_scan"] = tusrec_counts.get("runtime_forward_s_per_scan", 0) + int(batch_size)
+            tusrec_sums["runtime_e2e_s_per_scan"] = tusrec_sums.get("runtime_e2e_s_per_scan", 0.0) + float(runtime_e2e_per_scan) * batch_size
+            tusrec_counts["runtime_e2e_s_per_scan"] = tusrec_counts.get("runtime_e2e_s_per_scan", 0) + int(batch_size)
 
             trans_err_flat = trans_err.reshape(-1)
             rot_err_flat = rot_err.reshape(-1)
@@ -260,6 +275,8 @@ class RecEvaluator:
             metric_counts["end_to_start_rpe_mm"] = metric_counts.get("end_to_start_rpe_mm", 0) + int(loop_t.numel())
             metric_sums["end_to_start_rpe_deg"] = metric_sums.get("end_to_start_rpe_deg", 0.0) + float(loop_r.sum().item())
             metric_counts["end_to_start_rpe_deg"] = metric_counts.get("end_to_start_rpe_deg", 0) + int(loop_r.numel())
+            metric_sums["wrap_dist_enabled"] = metric_sums.get("wrap_dist_enabled", 0.0) + float(metrics["wrap_dist_enabled"]) * batch_size
+            metric_counts["wrap_dist_enabled"] = metric_counts.get("wrap_dist_enabled", 0) + int(batch_size)
 
             if extras.get("pred_volume") is not None and extras.get("gt_volume") is not None:
                 pred_volume = extras["pred_volume"]

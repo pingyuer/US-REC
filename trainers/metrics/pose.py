@@ -3,9 +3,6 @@
 
 from __future__ import annotations
 
-from typing import Optional
-import warnings
-
 import torch
 
 
@@ -81,7 +78,7 @@ def rotation_error_deg(
     return theta * (180.0 / torch.pi)
 
 
-def se3_translation_error(pred_T: torch.Tensor, gt_T: torch.Tensor) -> torch.Tensor:
+def se3_translation_error_mm(pred_T: torch.Tensor, gt_T: torch.Tensor) -> torch.Tensor:
     return translation_error_mm(pred_T[..., :3, 3], gt_T[..., :3, 3])
 
 
@@ -94,6 +91,6 @@ def se3_rotation_error_deg(
 __all__ = [
     "translation_error_mm",
     "rotation_error_deg",
-    "se3_translation_error",
+    "se3_translation_error_mm",
     "se3_rotation_error_deg",
 ]

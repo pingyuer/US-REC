@@ -238,6 +238,9 @@ class TUSRecS3Iterable(torch.utils.data.IterableDataset):
                     "scan_id": f"{info.subject}/{info.scan_name}",
                     "scan_name": info.scan_name,
                     "subject": info.subject,
+                    "frame_idx0": int(idx),
+                    "frame_idx1": int(idx + 1),
+                    "pair_mode": self.pair_mode,
                 },
             }
 

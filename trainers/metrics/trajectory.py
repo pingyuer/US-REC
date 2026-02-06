@@ -80,7 +80,7 @@ def rpe_rotation_deg(
     return err.mean(dim=-1)
 
 
-def endpoint_drift_rate(
+def drift_rate(
     pred_Ts: torch.Tensor, gt_Ts: torch.Tensor, *, eps: float = 1e-6
 ) -> torch.Tensor:
     """Endpoint translation error normalized by path length (gt)."""
@@ -97,5 +97,5 @@ __all__ = [
     "end_to_start_rpe_rotation_deg",
     "rpe_translation_mm",
     "rpe_rotation_deg",
-    "endpoint_drift_rate",
+    "drift_rate",
 ]

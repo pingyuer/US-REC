@@ -40,6 +40,11 @@ def parse_rec_cfg(cfg: Any) -> Dict[str, Any]:
 
     out["NUM_SAMPLES"] = int(get_cfg_value(cfg, "dataset.sampling.num_samples", 0))
     out["SAMPLE_RANGE"] = int(get_cfg_value(cfg, "dataset.sampling.sample_range", 0))
+    out["PAIR_MODE"] = str(get_cfg_value(cfg, "dataset.sampling.pair_mode", "adjacent"))
+    out["STRICT_ADJACENT_PAIRS"] = bool(get_cfg_value(cfg, "dataset.sampling.strict_adjacent_pairs", True))
+    out["PAIR_AUDIT_MAX_SAMPLES"] = int(get_cfg_value(cfg, "dataset.sampling.pair_audit_max_samples", 256))
+    out["POINT_MODE"] = str(get_cfg_value(cfg, "dataset.point_sampling.mode", "dense"))
+    out["POINT_GRID_SIZE"] = int(get_cfg_value(cfg, "dataset.point_sampling.grid_size", 16))
 
     out["MINIBATCH_SIZE_rec"] = int(get_cfg_value(cfg, "dataloader.train.batch_size", 1))
     out["MINIBATCH_SIZE_reg"] = int(

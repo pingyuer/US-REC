@@ -29,14 +29,16 @@ These metrics support freehand reconstruction and registration evaluation:
 
 - `trainers.metrics.translation_error_mm(pred_t, gt_t) -> L2 translation error`
 - `trainers.metrics.rotation_error_deg(pred_R, gt_R) -> rotation error (degrees)`
-- `trainers.metrics.se3_translation_error(pred_T, gt_T) -> translation-only SE(3) error (mm)`
+- `trainers.metrics.se3_translation_error_mm(pred_T, gt_T) -> translation-only SE(3) error (mm)`
 - `trainers.metrics.se3_rotation_error_deg(pred_T, gt_T) -> rotation-only SE(3) error (deg)`
 - `trainers.metrics.endpoint_rpe_translation_mm(pred_Ts, gt_Ts) -> endpoint RPE (mm)`
 - `trainers.metrics.endpoint_rpe_rotation_deg(pred_Ts, gt_Ts) -> endpoint RPE (deg)`
 - `trainers.metrics.end_to_start_rpe_translation_mm(pred_Ts, gt_Ts) -> loop return (mm)`
 - `trainers.metrics.end_to_start_rpe_rotation_deg(pred_Ts, gt_Ts) -> loop return (deg)`
-- `trainers.metrics.ddf_rmse(pred_ddf, gt_ddf)`
-- `trainers.metrics.ddf_mae(pred_ddf, gt_ddf)`
+- `trainers.metrics.ddf_rmse_all_dims(pred_ddf, gt_ddf)`
+- `trainers.metrics.ddf_mae_all_dims(pred_ddf, gt_ddf)`
+- `trainers.metrics.ddf_epe_vox(pred_ddf, gt_ddf)`
+- `trainers.metrics.ddf_epe_mm(pred_ddf, gt_ddf, spacing=(sx,sy,sz))`
 - `trainers.metrics.volume_ssim(pred_vol, gt_vol)`
 - `trainers.metrics.volume_ncc(pred_vol, gt_vol)`
 - `trainers.metrics.volume_dice(pred_vol, gt_vol)`
@@ -47,23 +49,23 @@ Example:
 from trainers.metrics import (
     translation_error_mm,
     rotation_error_deg,
-    se3_translation_error,
+    se3_translation_error_mm,
     se3_rotation_error_deg,
     endpoint_rpe_translation_mm,
     endpoint_rpe_rotation_deg,
     end_to_start_rpe_translation_mm,
     end_to_start_rpe_rotation_deg,
-    ddf_rmse,
+    ddf_rmse_all_dims,
     volume_ncc,
 )
 
 trans_err = translation_error_mm(pred_t, gt_t)
 rot_err = rotation_error_deg(pred_R, gt_R)
-se3_t = se3_translation_error(pred_T, gt_T)
+se3_t = se3_translation_error_mm(pred_T, gt_T)
 se3_r = se3_rotation_error_deg(pred_T, gt_T)
 drift_t = endpoint_rpe_translation_mm(pred_Ts, gt_Ts)
 drift_r = endpoint_rpe_rotation_deg(pred_Ts, gt_Ts)
-rmse = ddf_rmse(pred_ddf, gt_ddf)
+rmse = ddf_rmse_all_dims(pred_ddf, gt_ddf)
 ncc = volume_ncc(pred_vol, gt_vol)
 ```
 

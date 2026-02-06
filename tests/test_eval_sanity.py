@@ -1,6 +1,6 @@
 import torch
 
-from utils.metrics.tusrec_metrics import compute_tusrec_metrics
+from trainers.metrics import compute_tusrec_metrics
 
 
 def _make_transforms(num_frames: int, shift_mm: float = 0.0) -> torch.Tensor:
@@ -21,7 +21,7 @@ def test_tusrec_gt_zero_and_shift_growth():
         gt_transforms=gt,
         pred_transforms=gt,
         calib={"tform_calib": tform_calib},
-        compute_normalized=False,
+        compute_scores=False,
         chunk_rows=4,
     )
     assert metrics_gt["GPE_mm"] == 0.0
@@ -33,7 +33,7 @@ def test_tusrec_gt_zero_and_shift_growth():
         gt_transforms=gt,
         pred_transforms=pred_shift,
         calib={"tform_calib": tform_calib},
-        compute_normalized=False,
+        compute_scores=False,
         chunk_rows=4,
     )
     assert metrics_shift["GPE_mm"] >= 9.0

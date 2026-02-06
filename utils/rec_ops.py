@@ -20,11 +20,19 @@ def compute_dimention(label_pred_type, num_points_each_frame=None, num_frames=No
 
 
 def data_pairs_adjacent(num_frames):
-    # obtain the data_pairs to compute the tarnsfomration between adjacent frames
+    """
+    Build adjacent frame pairs with an identity anchor in front.
 
-    # return torch.tensor([[n0,n0+1] for n0 in range(num_frames-1)])# [0,1],[1,2],...[n-1,n]
-
-    return torch.tensor([[0, n0] for n0 in range(num_frames)])
+    Returns pairs shaped (num_frames, 2):
+    - pair[0] = [0, 0] (identity for frame0)
+    - pair[i] = [i-1, i] for i >= 1 (adjacent frame relation)
+    """
+    n = int(num_frames)
+    if n <= 0:
+        raise ValueError("num_frames must be >= 1")
+    pairs = [[0, 0]]
+    pairs.extend([[i - 1, i] for i in range(1, n)])
+    return torch.tensor(pairs, dtype=torch.long)
 
 
 

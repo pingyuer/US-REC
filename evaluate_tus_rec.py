@@ -19,10 +19,10 @@ from trainers.metrics import (
     endpoint_rpe_translation_mm,
     rotation_error_deg,
     se3_rotation_error_deg,
-    se3_translation_error,
+    se3_translation_error_mm,
     translation_error_mm,
-    ddf_rmse,
-    ddf_mae,
+    ddf_rmse_all_dims,
+    ddf_mae_all_dims,
     volume_ncc,
     volume_ssim,
     volume_dice,
@@ -65,7 +65,7 @@ def main() -> None:
 
     trans_err = translation_error_mm(pred_T[..., :3, 3], gt_T[..., :3, 3]).mean().item()
     rot_err = rotation_error_deg(pred_T[..., :3, :3], gt_T[..., :3, :3]).mean().item()
-    se3_trans = se3_translation_error(pred_T, gt_T).mean().item()
+    se3_trans = se3_translation_error_mm(pred_T, gt_T).mean().item()
     se3_rot = se3_rotation_error_deg(pred_T, gt_T).mean().item()
     drift_t = endpoint_rpe_translation_mm(pred_T, gt_T).mean().item()
     drift_r = endpoint_rpe_rotation_deg(pred_T, gt_T).mean().item()
@@ -84,11 +84,11 @@ def main() -> None:
     if args.pred_ddf and args.gt_ddf:
         pred_ddf = _load_tensor(args.pred_ddf).float()
         gt_ddf = _load_tensor(args.gt_ddf).float()
-        _print_row("ddf_rmse", ddf_rmse(pred_ddf, gt_ddf).item())
-        _print_row("ddf_mae", ddf_mae(pred_ddf, gt_ddf).item())
+        _print_row("ddf_rmse_all_dims", ddf_rmse_all_dims(pred_ddf, gt_ddf).item())
+        _print_row("ddf_mae_all_dims", ddf_mae_all_dims(pred_ddf, gt_ddf).item())
     else:
-        _print_row("ddf_rmse", None)
-        _print_row("ddf_mae", None)
+        _print_row("ddf_rmse_all_dims", None)
+        _print_row("ddf_mae_all_dims", None)
 
     if args.pred_vol and args.gt_vol:
         pred_vol = _load_tensor(args.pred_vol).float()

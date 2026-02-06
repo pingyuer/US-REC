@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 from typing import Optional, Sequence
-import warnings
 
 import torch
 
@@ -79,22 +78,10 @@ def ddf_epe_mm(
     return ddf_epe_mean(pred_ddf, gt_ddf, vec_dim=vec_dim, spacing=spacing)
 
 
-def ddf_rmse(pred_ddf: torch.Tensor, gt_ddf: torch.Tensor) -> torch.Tensor:
-    warnings.warn("ddf_rmse is deprecated; use ddf_rmse_all_dims.", RuntimeWarning)
-    return ddf_rmse_all_dims(pred_ddf, gt_ddf)
-
-
-def ddf_mae(pred_ddf: torch.Tensor, gt_ddf: torch.Tensor) -> torch.Tensor:
-    warnings.warn("ddf_mae is deprecated; use ddf_mae_all_dims.", RuntimeWarning)
-    return ddf_mae_all_dims(pred_ddf, gt_ddf)
-
-
 __all__ = [
     "ddf_rmse_all_dims",
     "ddf_mae_all_dims",
     "ddf_epe_mean",
     "ddf_epe_vox",
     "ddf_epe_mm",
-    "ddf_rmse",
-    "ddf_mae",
 ]

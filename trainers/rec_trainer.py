@@ -51,7 +51,7 @@ from trainers.metrics import (
     endpoint_rpe_translation_mm,
     rotation_error_deg,
     se3_rotation_error_deg,
-    se3_translation_error,
+    se3_translation_error_mm,
     translation_error_mm,
     volume_ncc,
     volume_ssim,
@@ -106,6 +106,12 @@ class Train_Rec_Reg_Model:
         self.epoch = 0
         self.global_step = 0
         self.ctx = None
+        self._pair_audit_checked = 0
+        self._pair_audit_adjacent = 0
+        self._pair_audit_non_adjacent = 0
+        self._pair_audit_reported = False
+        self._pair_audit_logged = False
+        self._coord_reported = False
 
     def _load_cfg_fields(self) -> None:
         fields = parse_rec_cfg(self.cfg)
@@ -150,16 +156,114 @@ class Train_Rec_Reg_Model:
         # Align NUM_SAMPLES to actual sample length (pair-based datasets use 2).
         self.NUM_SAMPLES = int(frames_sample.shape[0])
         self.data_pairs = data_pairs_adjacent(self.NUM_SAMPLES)
-        self.image_points = reference_image_points(
-            (frames_sample.shape[1], frames_sample.shape[2]),
-            (frames_sample.shape[1], frames_sample.shape[2]),
-        ).to(self.device)
+        if str(getattr(self, "PAIR_MODE", "adjacent")).lower() == "adjacent" and self.data_pairs.shape[0] > 1:
+            deltas = self.data_pairs[1:, 1] - self.data_pairs[1:, 0]
+            if not torch.all(deltas == 1):
+                raise RuntimeError(
+                    f"pair_mode=adjacent but data_pairs are not adjacent: {self.data_pairs.tolist()}"
+                )
+        self.image_points = self._build_image_points(frames_sample.shape[1], frames_sample.shape[2]).to(self.device)
+        self._report_coordinate_contract_once()
         self.pred_dim = compute_dimention(
             self.PRED_TYPE, self.image_points.shape[1], self.NUM_SAMPLES, "pred"
         )
         self.label_dim = compute_dimention(
             self.LABEL_TYPE, self.image_points.shape[1], self.NUM_SAMPLES, "label"
         )
+
+    def _build_image_points(self, height: int, width: int) -> torch.Tensor:
+        mode = str(getattr(self, "POINT_MODE", "dense")).lower().strip()
+        if mode == "corners":
+            density = (2, 2)
+        elif mode == "sparse":
+            g = max(2, int(getattr(self, "POINT_GRID_SIZE", 16)))
+            density = (g, g)
+        elif mode == "dense":
+            density = (int(height), int(width))
+        else:
+            raise ValueError(f"Unsupported dataset.point_sampling.mode={mode}")
+        pts = reference_image_points((int(height), int(width)), density)
+        max_x = float(pts[0].max().item())
+        max_y = float(pts[1].max().item())
+        if max_x > float(height - 1) + 1e-6 or max_y > float(width - 1) + 1e-6:
+            raise ValueError(
+                f"image_points out of bounds: max=({max_x:.3f},{max_y:.3f}) vs "
+                f"(H-1,W-1)=({height - 1},{width - 1})"
+            )
+        return pts
+
+    def _report_coordinate_contract_once(self) -> None:
+        if self._coord_reported:
+            return
+        self._coord_reported = True
+        pts = self.image_points.detach().cpu()
+        calib = torch.as_tensor(self.tform_calib).detach().cpu()
+        scale = torch.as_tensor(self.tform_calib_scale).detach().cpu()
+        print(
+            "[coords] image_points(min/max xy)="
+            f"({pts[0].min().item():.3f},{pts[1].min().item():.3f})/"
+            f"({pts[0].max().item():.3f},{pts[1].max().item():.3f}), "
+            "convention=pixel(top-left origin, x=row, y=col)"
+        )
+        print(
+            "[coords] calib(pixel->tool-mm) diag="
+            f"{torch.diagonal(calib[:3, :3]).tolist()} "
+            f"trans={calib[:3, 3].tolist()} scale={scale.tolist() if scale.numel() else scale.item()}"
+        )
+
+    def _audit_pair_mode_once(self, batch) -> None:
+        if self._pair_audit_reported:
+            return
+        max_samples = int(getattr(self, "PAIR_AUDIT_MAX_SAMPLES", 256))
+        if self._pair_audit_checked >= max_samples:
+            self._pair_audit_reported = True
+            ratio = self._pair_audit_adjacent / max(1, self._pair_audit_checked)
+            print(
+                f"[pair-audit] checked={self._pair_audit_checked}, "
+                f"adjacent={self._pair_audit_adjacent}, non_adjacent={self._pair_audit_non_adjacent}, "
+                f"adjacent_ratio={ratio:.4f}"
+            )
+            return
+
+        if not isinstance(batch, dict) or "meta" not in batch:
+            return
+        meta = batch["meta"]
+        f0 = f1 = None
+        if isinstance(meta, dict):
+            if "frame_idx0" in meta and "frame_idx1" in meta:
+                f0, f1 = meta["frame_idx0"], meta["frame_idx1"]
+        if f0 is None or f1 is None:
+            return
+
+        f0_t = torch.as_tensor(f0).reshape(-1)
+        f1_t = torch.as_tensor(f1).reshape(-1)
+        n = min(f0_t.numel(), f1_t.numel())
+        if n <= 0:
+            return
+        diff = (f1_t[:n] - f0_t[:n]).to(torch.long)
+        adjacent = int((diff == 1).sum().item())
+        non_adjacent = int((diff != 1).sum().item())
+        self._pair_audit_checked += int(n)
+        self._pair_audit_adjacent += adjacent
+        self._pair_audit_non_adjacent += non_adjacent
+        if not self._pair_audit_logged:
+            self._pair_audit_logged = True
+            ratio = self._pair_audit_adjacent / max(1, self._pair_audit_checked)
+            print(
+                f"[pair-audit] checked={self._pair_audit_checked}, "
+                f"adjacent={self._pair_audit_adjacent}, non_adjacent={self._pair_audit_non_adjacent}, "
+                f"adjacent_ratio={ratio:.4f}"
+            )
+
+        if (
+            str(getattr(self, "PAIR_MODE", "adjacent")).lower() == "adjacent"
+            and bool(getattr(self, "STRICT_ADJACENT_PAIRS", True))
+            and non_adjacent > 0
+        ):
+            raise RuntimeError(
+                f"pair_mode=adjacent violated: found non-adjacent pairs in batch "
+                f"(adjacent={adjacent}, non_adjacent={non_adjacent})"
+            )
 
     def _init_transforms(self) -> None:
         self.transform_label, self.transform_prediction = build_transforms(
@@ -218,6 +322,7 @@ class Train_Rec_Reg_Model:
                 fn(self, **kwargs)
 
     def _run_step(self, batch, step):
+        self._audit_pair_mode_once(batch)
         frames, tforms, tforms_inv = unpack_batch(batch)
         frames = frames.to(self.device)
         tforms = tforms.to(self.device)
@@ -274,7 +379,7 @@ class Train_Rec_Reg_Model:
             pred_transfs[..., :3, 3], tforms_each_frame2frame0[..., :3, 3]
         )
         rot_err = rotation_error_deg(pred_transfs[..., :3, :3], tforms_each_frame2frame0[..., :3, :3])
-        se3_trans = se3_translation_error(pred_transfs, tforms_each_frame2frame0)
+        se3_trans = se3_translation_error_mm(pred_transfs, tforms_each_frame2frame0)
         se3_rot = se3_rotation_error_deg(pred_transfs, tforms_each_frame2frame0)
         metrics["translation_error_mm"] = trans_err.mean().item()
         metrics["rotation_error_deg"] = rot_err.mean().item()
@@ -289,6 +394,7 @@ class Train_Rec_Reg_Model:
         metrics["endpoint_rpe_deg"] = float(drift_r.mean().item())
         metrics["end_to_start_rpe_mm"] = float(loop_t.mean().item())
         metrics["end_to_start_rpe_deg"] = float(loop_r.mean().item())
+        metrics["wrap_dist_enabled"] = 1.0 if bool(extras.get("wrap_enabled", False)) else 0.0
         if extras.get("pred_volume") is not None and extras.get("gt_volume") is not None:
             pred_volume = extras["pred_volume"]
             gt_volume = extras["gt_volume"]

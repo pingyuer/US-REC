@@ -1,15 +1,15 @@
 import torch
 
 from trainers.metrics import (
-    endpoint_rpe_translation_mm,
+    ddf_mae_all_dims,
+    ddf_rmse_all_dims,
     endpoint_rpe_rotation_deg,
-    ddf_mae,
-    ddf_rmse,
+    endpoint_rpe_translation_mm,
     end_to_start_rpe_translation_mm,
     end_to_start_rpe_rotation_deg,
     rotation_error_deg,
     se3_rotation_error_deg,
-    se3_translation_error,
+    se3_translation_error_mm,
     translation_error_mm,
     volume_dice,
     volume_ncc,
@@ -41,7 +41,7 @@ def test_rotation_error_identity():
 def test_se3_errors_nonzero():
     pred = _make_T([1.0, 0.0, 0.0]).unsqueeze(0)
     gt = _make_T([0.0, 0.0, 0.0]).unsqueeze(0)
-    trans_err = se3_translation_error(pred, gt)
+    trans_err = se3_translation_error_mm(pred, gt)
     rot_err = se3_rotation_error_deg(pred, gt)
     assert trans_err.item() > 0
     assert rot_err.item() == 0
@@ -64,8 +64,8 @@ def test_trajectory_metrics_zero():
 def test_ddf_metrics_zero():
     pred = torch.zeros(2, 3, 4, 4, 4)
     gt = torch.zeros(2, 3, 4, 4, 4)
-    assert ddf_rmse(pred, gt) == 0
-    assert ddf_mae(pred, gt) == 0
+    assert ddf_rmse_all_dims(pred, gt) == 0
+    assert ddf_mae_all_dims(pred, gt) == 0
 
 
 def test_volume_metrics_basic():
