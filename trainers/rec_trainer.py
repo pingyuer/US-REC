@@ -93,15 +93,6 @@ class Train_Rec_Reg_Model:
         self.save_path = save_path
         self.multi_gpu = bool(OmegaConf.select(cfg, "runtime.multi_gpu") or False)
 
-        self._load_cfg_fields()
-        self._init_datasets(dset_train, dset_val)
-        self._init_dataloaders()
-        self._init_calibration()
-        self._init_example_state()
-        self._init_transforms()
-        self._init_models()
-        self._init_optimizer(reg_loss_weight)
-
         self.hooks: list[Hook] = []
         self.epoch = 0
         self.global_step = 0
@@ -112,6 +103,15 @@ class Train_Rec_Reg_Model:
         self._pair_audit_reported = False
         self._pair_audit_logged = False
         self._coord_reported = False
+
+        self._load_cfg_fields()
+        self._init_datasets(dset_train, dset_val)
+        self._init_dataloaders()
+        self._init_calibration()
+        self._init_example_state()
+        self._init_transforms()
+        self._init_models()
+        self._init_optimizer(reg_loss_weight)
 
     def _load_cfg_fields(self) -> None:
         fields = parse_rec_cfg(self.cfg)

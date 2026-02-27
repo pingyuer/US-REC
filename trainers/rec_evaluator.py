@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 import time
+from collections import defaultdict
 
 import torch
 from omegaconf import OmegaConf
@@ -41,6 +42,74 @@ class RecEvaluator:
     def __init__(self, *, device: str | torch.device):
         self.device = device
 
+    @staticmethod
+    def _canonical_scan_id(scan_id: Any, sample_index: int) -> str:
+        if isinstance(scan_id, (list, tuple)):
+            if len(scan_id) == 1:
+                return str(scan_id[0])
+            return "/".join(str(x) for x in scan_id)
+        if scan_id is None:
+            return f"sample_{sample_index}"
+        return str(scan_id)
+
+    @staticmethod
+    def _aggregate_tusrec_rows_by_scan(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        sums: dict[str, dict[str, float]] = defaultdict(dict)
+        counts: dict[str, dict[str, int]] = defaultdict(dict)
+        pair_counts: dict[str, int] = defaultdict(int)
+
+        for row in rows:
+            sid = str(row.get("scan_id", "unknown"))
+            for key, value in row.items():
+                if key == "scan_id" or value is None:
+                    continue
+                if key == "num_pairs" and isinstance(value, (int, float)):
+                    pair_counts[sid] += int(value)
+                    continue
+                if isinstance(value, (int, float)):
+                    sums[sid][key] = sums[sid].get(key, 0.0) + float(value)
+                    counts[sid][key] = counts[sid].get(key, 0) + 1
+
+        out: list[dict[str, Any]] = []
+        for sid in sorted(sums.keys()):
+            entry = {"scan_id": sid}
+            for key, total in sums[sid].items():
+                cnt = max(1, counts[sid].get(key, 1))
+                entry[key] = float(total / cnt)
+            entry["num_pairs"] = int(pair_counts.get(sid, 0))
+            out.append(entry)
+        return out
+
+    @staticmethod
+    def _meta_value(meta: Any, key: str, idx: int):
+        if isinstance(meta, dict):
+            value = meta.get(key)
+            if isinstance(value, list):
+                if not value:
+                    return None
+                return value[idx] if idx < len(value) else value[0]
+            return value
+        if isinstance(meta, list):
+            if idx < len(meta) and isinstance(meta[idx], dict):
+                return meta[idx].get(key)
+            return None
+        return None
+
+    @staticmethod
+    def _compose_global_from_locals(local_by_frame: dict[int, torch.Tensor], *, dtype, device):
+        if not local_by_frame:
+            eye = torch.eye(4, dtype=dtype, device=device)
+            return eye.unsqueeze(0)
+        max_frame = max(int(k) for k in local_by_frame.keys())
+        eye = torch.eye(4, dtype=dtype, device=device)
+        globals_list = [eye]
+        for frame_idx in range(1, max_frame + 1):
+            local_tf = local_by_frame.get(frame_idx)
+            if local_tf is None:
+                local_tf = eye
+            globals_list.append(torch.matmul(globals_list[-1], local_tf))
+        return torch.stack(globals_list, dim=0)
+
     @torch.no_grad()
     def run(
         self,
@@ -73,6 +142,7 @@ class RecEvaluator:
         tusrec_sums: dict[str, float] = {}
         tusrec_counts: dict[str, int] = {}
         tusrec_rows: list[dict[str, Any]] = []
+        scan_state: dict[str, dict[str, Any]] = {}
         loss_sums = {
             "loss": 0.0,
             "loss_rec": 0.0,
@@ -196,7 +266,6 @@ class RecEvaluator:
                 metrics["volume_dice"] = float(volume_dice(pred_volume, gt_volume).mean().item())
 
             batch_size = int(frames.shape[0]) if frames.ndim >= 4 else 1
-            batch_start_index = len(tusrec_rows)
             for idx in range(batch_size):
                 frame_seq = frames[idx] if frames.ndim >= 4 else frames
                 gt_seq = tforms_each_frame2frame0[idx] if tforms_each_frame2frame0.ndim == 4 else tforms_each_frame2frame0
@@ -209,51 +278,60 @@ class RecEvaluator:
                         if torch.is_tensor(lm):
                             landmarks = lm[idx] if lm.ndim >= 3 else lm
                     if "scan_id" in batch:
-                        scan_id = batch["scan_id"][idx] if isinstance(batch["scan_id"], list) else batch["scan_id"]
+                        scan_field = batch["scan_id"]
+                        if isinstance(scan_field, list):
+                            scan_id = scan_field[idx] if idx < len(scan_field) else scan_field[0]
+                        else:
+                            scan_id = scan_field
                     elif "meta" in batch:
                         meta = batch["meta"]
                         if isinstance(meta, list) and idx < len(meta) and isinstance(meta[idx], dict):
                             scan_id = meta[idx].get("scan_id") or meta[idx].get("scan_name")
                         elif isinstance(meta, dict):
-                            scan_id = meta.get("scan_id") or meta.get("scan_name")
-                tusrec = compute_tusrec_metrics(
-                    frames=frame_seq,
-                    gt_transforms=gt_seq,
-                    pred_transforms=pred_seq,
-                    calib={
-                        "tform_calib": trainer.tform_calib,
-                        "spacing_mm": getattr(trainer, "tform_calib_scale", None),
-                    },
-                    landmarks=landmarks,
-                    image_points=trainer.image_points,
-                    enforce_lp_gp_distinct=bool(
-                        OmegaConf.select(cfg, "metrics.tusrec.enforce_lp_gp_distinct")
-                        if OmegaConf.is_config(cfg)
-                        else False
-                    ),
-                )
-                row = {"scan_id": scan_id or f"sample_{sample_index}"}
-                row.update({k: v for k, v in tusrec.items() if v is not None})
-                tusrec_rows.append(row)
-                for key, value in tusrec.items():
-                    if value is None:
-                        continue
-                    tusrec_sums[key] = tusrec_sums.get(key, 0.0) + float(value)
-                    tusrec_counts[key] = tusrec_counts.get(key, 0) + 1
+                            meta_scan_id = meta.get("scan_id")
+                            if isinstance(meta_scan_id, list):
+                                scan_id = meta_scan_id[idx] if idx < len(meta_scan_id) else meta_scan_id[0]
+                            else:
+                                scan_id = meta_scan_id or meta.get("scan_name")
+
+                sid = self._canonical_scan_id(scan_id, sample_index)
+                meta_obj = batch.get("meta") if isinstance(batch, dict) else None
+                frame_idx1 = self._meta_value(meta_obj, "frame_idx1", idx)
+                if frame_idx1 is None:
+                    frame_idx0 = self._meta_value(meta_obj, "frame_idx0", idx)
+                    frame_idx1 = int(frame_idx0) + 1 if frame_idx0 is not None else 1
+                frame_idx1 = int(frame_idx1)
+
+                if sid not in scan_state:
+                    h = int(frame_seq.shape[-2])
+                    w = int(frame_seq.shape[-1])
+                    scan_state[sid] = {
+                        "locals_gt": {},
+                        "locals_pred": {},
+                        "image_size": (h, w),
+                        "landmarks": landmarks,
+                        "runtime_forward": [],
+                        "runtime_e2e": [],
+                    }
+                scan_state[sid]["locals_gt"][frame_idx1] = gt_seq[1].detach()
+                scan_state[sid]["locals_pred"][frame_idx1] = pred_seq[1].detach()
+                if landmarks is not None and scan_state[sid]["landmarks"] is None:
+                    scan_state[sid]["landmarks"] = landmarks
                 sample_index += 1
 
             runtime_forward_per_scan = (time.perf_counter() - forward_start_time) / max(batch_size, 1)
             runtime_e2e_per_scan = (time.perf_counter() - batch_start_time) / max(batch_size, 1)
-            for row in tusrec_rows[batch_start_index:]:
-                row["runtime_s_per_scan"] = runtime_forward_per_scan
-                row["runtime_forward_s_per_scan"] = runtime_forward_per_scan
-                row["runtime_e2e_s_per_scan"] = runtime_e2e_per_scan
-            tusrec_sums["runtime_s_per_scan"] = tusrec_sums.get("runtime_s_per_scan", 0.0) + float(runtime_forward_per_scan) * batch_size
-            tusrec_counts["runtime_s_per_scan"] = tusrec_counts.get("runtime_s_per_scan", 0) + int(batch_size)
-            tusrec_sums["runtime_forward_s_per_scan"] = tusrec_sums.get("runtime_forward_s_per_scan", 0.0) + float(runtime_forward_per_scan) * batch_size
-            tusrec_counts["runtime_forward_s_per_scan"] = tusrec_counts.get("runtime_forward_s_per_scan", 0) + int(batch_size)
-            tusrec_sums["runtime_e2e_s_per_scan"] = tusrec_sums.get("runtime_e2e_s_per_scan", 0.0) + float(runtime_e2e_per_scan) * batch_size
-            tusrec_counts["runtime_e2e_s_per_scan"] = tusrec_counts.get("runtime_e2e_s_per_scan", 0) + int(batch_size)
+            if isinstance(batch, dict) and "meta" in batch:
+                meta_obj = batch["meta"]
+                for idx in range(batch_size):
+                    sid = self._canonical_scan_id(
+                        self._meta_value(meta_obj, "scan_id", idx)
+                        or self._meta_value(meta_obj, "scan_name", idx),
+                        sample_index + idx,
+                    )
+                    if sid in scan_state:
+                        scan_state[sid]["runtime_forward"].append(float(runtime_forward_per_scan))
+                        scan_state[sid]["runtime_e2e"].append(float(runtime_e2e_per_scan))
 
             trans_err_flat = trans_err.reshape(-1)
             rot_err_flat = rot_err.reshape(-1)
@@ -310,6 +388,56 @@ class RecEvaluator:
                 ):
                     break
 
+        # Paper-aligned protocol: evaluate GPE/LPE on scan-level trajectories.
+        for sid in sorted(scan_state.keys()):
+            state = scan_state[sid]
+            locals_gt = state["locals_gt"]
+            locals_pred = state["locals_pred"]
+            if not locals_gt or not locals_pred:
+                continue
+            dtype = next(iter(locals_gt.values())).dtype
+            device_scan = next(iter(locals_gt.values())).device
+            gt_global = self._compose_global_from_locals(locals_gt, dtype=dtype, device=device_scan)
+            pred_global = self._compose_global_from_locals(locals_pred, dtype=dtype, device=device_scan)
+            num_frames = int(min(gt_global.shape[0], pred_global.shape[0]))
+            if num_frames <= 1:
+                continue
+            gt_global = gt_global[:num_frames]
+            pred_global = pred_global[:num_frames]
+            h, w = state["image_size"]
+            dummy_frames = torch.zeros((1, int(h), int(w)), dtype=dtype, device=device_scan)
+            tusrec = compute_tusrec_metrics(
+                frames=dummy_frames,
+                gt_transforms=gt_global,
+                pred_transforms=pred_global,
+                calib={
+                    "tform_calib": trainer.tform_calib,
+                    "spacing_mm": getattr(trainer, "tform_calib_scale", None),
+                },
+                landmarks=state.get("landmarks"),
+                image_points=trainer.image_points,
+                enforce_lp_gp_distinct=bool(
+                    OmegaConf.select(cfg, "metrics.tusrec.enforce_lp_gp_distinct")
+                    if OmegaConf.is_config(cfg)
+                    else False
+                ),
+            )
+            row = {"scan_id": sid}
+            row.update({k: v for k, v in tusrec.items() if v is not None})
+            if state["runtime_forward"]:
+                row["runtime_s_per_scan"] = float(sum(state["runtime_forward"]) / len(state["runtime_forward"]))
+                row["runtime_forward_s_per_scan"] = row["runtime_s_per_scan"]
+            if state["runtime_e2e"]:
+                row["runtime_e2e_s_per_scan"] = float(sum(state["runtime_e2e"]) / len(state["runtime_e2e"]))
+            row["num_pairs"] = int(min(len(locals_gt), len(locals_pred)))
+            tusrec_rows.append(row)
+            for key, value in row.items():
+                if key in {"scan_id", "num_pairs"} or value is None:
+                    continue
+                if isinstance(value, (int, float)):
+                    tusrec_sums[key] = tusrec_sums.get(key, 0.0) + float(value)
+                    tusrec_counts[key] = tusrec_counts.get(key, 0) + 1
+
         avg_metrics = {
             key: (metric_sums[key] / max(metric_counts.get(key, 1), 1))
             for key in metric_sums
@@ -323,7 +451,7 @@ class RecEvaluator:
             avg_metrics[f"{mode}_dist"] = loss_sums["dist"] / loss_count
             avg_metrics[f"{mode}_wrap_dist"] = loss_sums["wrap_dist"] / loss_count
         if tusrec_rows:
-            avg_metrics["tusrec_per_scan"] = tusrec_rows
+            avg_metrics["tusrec_per_scan"] = self._aggregate_tusrec_rows_by_scan(tusrec_rows)
 
         for cb in callbacks:
             fn = getattr(cb, "on_end", None)

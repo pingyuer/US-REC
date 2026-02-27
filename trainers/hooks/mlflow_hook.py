@@ -97,6 +97,7 @@ class MLflowHook(Hook):
         self.best_metric_value = None
         self.best_mode = None
         self._warned = False
+        self._local_metrics_path: Optional[Path] = None
 
     def _build_logger(self, cfg: Any) -> BaseExperimentLogger:
         mlflow_cfg = OmegaConf.select(cfg, "logging.mlflow")
@@ -183,6 +184,14 @@ class MLflowHook(Hook):
         self.logger.log_params(params)
         self._log_calib_summary(trainer)
 
+        # Initialize local metric mirror (MLflow metrics are also stored locally).
+        ctx = getattr(trainer, "ctx", None)
+        run_dir = getattr(ctx, "run_dir", None) if ctx is not None else None
+        if run_dir:
+            out_dir = Path(run_dir) / "metrics"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            self._local_metrics_path = out_dir / "mlflow_metrics_local.jsonl"
+
     def after_step(self, trainer, log_buffer=None):
         if not log_buffer:
             return
@@ -194,6 +203,7 @@ class MLflowHook(Hook):
             metrics["train/lr"] = float(log_buffer["lr"])
         if metrics:
             self.logger.log_metrics(metrics, step=step)
+            self._log_metrics_local(phase="train_step", step=step, metrics=metrics)
 
     def after_epoch(self, trainer, log_buffer=None):
         if not log_buffer:
@@ -206,6 +216,7 @@ class MLflowHook(Hook):
             metrics["train/epoch_lr"] = float(log_buffer["lr"])
         if metrics:
             self.logger.log_metrics(metrics, step=epoch)
+            self._log_metrics_local(phase="train_epoch", step=epoch, metrics=metrics)
 
     def after_val(self, trainer, log_buffer=None):
         if not log_buffer:
@@ -220,6 +231,7 @@ class MLflowHook(Hook):
                 metrics[f"val/{key}" if key != "val_loss" else "val/loss"] = float(value)
         if metrics:
             self.logger.log_metrics(metrics, step=epoch)
+            self._log_metrics_local(phase="val", step=epoch, metrics=metrics)
 
         metric_name, mode = self._resolve_best_metric(log_buffer)
         metric_value = log_buffer.get(metric_name)
@@ -240,6 +252,21 @@ class MLflowHook(Hook):
 
         if tusrec_rows:
             self._log_tusrec_rows(trainer, tusrec_rows)
+
+    def _log_metrics_local(self, *, phase: str, step: int, metrics: Dict[str, float]) -> None:
+        if not metrics:
+            return
+        out_path = self._local_metrics_path
+        if out_path is None:
+            return
+        payload = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "phase": str(phase),
+            "step": int(step),
+            "metrics": {k: float(v) for k, v in metrics.items()},
+        }
+        with out_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
     def after_run(self, trainer, mode: str = "train"):
         self._save_last_checkpoint(trainer)
@@ -289,8 +316,27 @@ class MLflowHook(Hook):
         out_dir = Path(run_dir) / "metrics"
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / "val_tusrec_per_scan.json"
+
+        # Save compact summary only (mean over scans), instead of full row list.
+        sums: dict[str, float] = {}
+        counts: dict[str, int] = {}
+        for row in rows:
+            for key, value in row.items():
+                if key in {"scan_id", "num_pairs"} or value is None:
+                    continue
+                if isinstance(value, (int, float)):
+                    sums[key] = sums.get(key, 0.0) + float(value)
+                    counts[key] = counts.get(key, 0) + 1
+        mean_metrics = {
+            key: (sums[key] / max(1, counts.get(key, 1)))
+            for key in sorted(sums.keys())
+        }
+        payload = {
+            "scan_count": int(len(rows)),
+            "mean_metrics": mean_metrics,
+        }
         with out_path.open("w", encoding="utf-8") as f:
-            json.dump(rows, f, ensure_ascii=False, indent=2)
+            json.dump(payload, f, ensure_ascii=False, indent=2)
         self.logger.log_artifact(str(out_path), artifact_path="metrics")
 
     def _log_calib_summary(self, trainer) -> None:
