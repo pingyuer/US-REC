@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import warnings
+
 import torch
 
 
@@ -73,7 +75,9 @@ def rotation_error_deg(
     rel = pred @ gt.transpose(-1, -2)
     trace = rel.diagonal(dim1=-2, dim2=-1).sum(-1)
     cos_theta = (trace - 1.0) * 0.5
-    cos_theta = torch.clamp(cos_theta, -1.0 + eps, 1.0 - eps)
+    # Clamp strictly to [-1, 1] to guard against float32 rounding that pushes
+    # the value slightly outside the domain of acos (e.g. 1.0000001).
+    cos_theta = torch.clamp(cos_theta, -1.0, 1.0)
     theta = torch.acos(cos_theta)
     return theta * (180.0 / torch.pi)
 

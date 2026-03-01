@@ -8,6 +8,7 @@ import torch
 from omegaconf import OmegaConf
 
 from trainers.metrics import (
+    compose_global_from_local,
     compute_tusrec_metrics,
     end_to_start_rpe_rotation_deg,
     end_to_start_rpe_translation_mm,
@@ -37,6 +38,18 @@ class RecEvaluator:
     Evaluation loop for reconstruction/registration models.
 
     Expects batches with keys: frames, tforms, tforms_inv.
+
+    Transform convention
+    --------------------
+    * The dataset yields **pairs** of consecutive frames (frame_idx0, frame_idx1).
+    * ``LabelTransform.to_transform_t2t`` produces per-pair local transforms:
+      ``T_prev_from_curr[i] = T_{i-1 <- i}`` — maps frame *i* into frame *i-1*.
+    * These are collected in ``scan_state[sid]["locals_gt"]`` /
+      ``scan_state[sid]["locals_pred"]``, keyed by *frame_idx1*.
+    * Global transforms are accumulated using the **single authoritative**
+      :func:`compose_global_from_local`:
+      ``global[0] = I``,  ``global[i] = global[i-1] @ local[i]``.
+    * Each scan resets ``global[0] = I`` — no cross-scan leakage.
     """
 
     def __init__(self, *, device: str | torch.device):
@@ -96,19 +109,39 @@ class RecEvaluator:
         return None
 
     @staticmethod
-    def _compose_global_from_locals(local_by_frame: dict[int, torch.Tensor], *, dtype, device):
+    def _compose_global_from_locals(
+        local_by_frame: dict[int, torch.Tensor],
+        *,
+        dtype,
+        device,
+    ) -> torch.Tensor:
+        """Build global transforms ``T_{0<-i}`` from per-frame locals ``T_{i-1<-i}``.
+
+        Uses the **single authoritative** :func:`compose_global_from_local`.
+        Each call represents ONE scan — global[0] is always reset to I.
+
+        Parameters
+        ----------
+        local_by_frame : dict mapping frame_idx (int) -> (4, 4) Tensor
+            Local transforms ``T_prev_from_curr`` keyed by frame number.
+            Key 0 is absent (frame 0 has no predecessor).
+        """
         if not local_by_frame:
             eye = torch.eye(4, dtype=dtype, device=device)
             return eye.unsqueeze(0)
         max_frame = max(int(k) for k in local_by_frame.keys())
         eye = torch.eye(4, dtype=dtype, device=device)
-        globals_list = [eye]
+        # Assemble a dense (T, 4, 4) tensor from the sparse dict.
+        # Missing frames are filled with I (no motion).
+        local_list = [eye]  # frame 0 = I
         for frame_idx in range(1, max_frame + 1):
             local_tf = local_by_frame.get(frame_idx)
             if local_tf is None:
                 local_tf = eye
-            globals_list.append(torch.matmul(globals_list[-1], local_tf))
-        return torch.stack(globals_list, dim=0)
+            local_list.append(local_tf)
+        local_dense = torch.stack(local_list, dim=0)  # (T, 4, 4)
+        # Convention: local_dense[i] = T_{i-1 <- i} (prev_from_curr)
+        return compose_global_from_local(local_dense, convention="prev_from_curr")
 
     @torch.no_grad()
     def run(
@@ -315,6 +348,9 @@ class RecEvaluator:
                     }
                 scan_state[sid]["locals_gt"][frame_idx1] = gt_seq[1].detach()
                 scan_state[sid]["locals_pred"][frame_idx1] = pred_seq[1].detach()
+                # Convention note: gt_seq[1] / pred_seq[1] are local transforms
+                # T_{prev_from_curr} = T_{frame_idx0 <- frame_idx1} produced by
+                # LabelTransform.to_transform_t2t / PredictionTransform.
                 if landmarks is not None and scan_state[sid]["landmarks"] is None:
                     scan_state[sid]["landmarks"] = landmarks
                 sample_index += 1
@@ -389,6 +425,9 @@ class RecEvaluator:
                     break
 
         # Paper-aligned protocol: evaluate GPE/LPE on scan-level trajectories.
+        # Each scan resets global[0] = I — no cross-scan accumulation.
+        from trainers.metrics.tusrec import local_from_global as _lfg
+
         for sid in sorted(scan_state.keys()):
             state = scan_state[sid]
             locals_gt = state["locals_gt"]
@@ -404,6 +443,34 @@ class RecEvaluator:
                 continue
             gt_global = gt_global[:num_frames]
             pred_global = pred_global[:num_frames]
+
+            # Store for downstream callbacks (e.g. VizHook)
+            state["globals_gt"] = gt_global
+            state["globals_pred"] = pred_global
+
+            # ---- diagnostic logging (3 sample frames per scan) ----
+            _sample_idxs = [1, 2, num_frames - 1] if num_frames > 2 else [1]
+            _local_pred_dense = _lfg(pred_global)
+            _local_gt_dense = _lfg(gt_global)
+            for _si in _sample_idxs:
+                if _si >= num_frames:
+                    continue
+                _lp_norm = float(torch.linalg.norm(_local_pred_dense[_si, :3, 3]).item())
+                _lg_norm = float(torch.linalg.norm(_local_gt_dense[_si, :3, 3]).item())
+                _gp_norm = float(torch.linalg.norm(pred_global[_si, :3, 3]).item())
+                _gg_norm = float(torch.linalg.norm(gt_global[_si, :3, 3]).item())
+                # Sanity: local should equal inv(global[i-1]) @ global[i].
+                _recon = torch.matmul(
+                    torch.linalg.inv(pred_global[_si - 1]),
+                    pred_global[_si],
+                )
+                _sanity = float(torch.abs(_local_pred_dense[_si] - _recon).mean().item())
+                print(
+                    f"[diag] scan={sid} frame={_si}/{num_frames-1}  "
+                    f"local_pred_t_norm={_lp_norm:.4f}mm  local_gt_t_norm={_lg_norm:.4f}mm  "
+                    f"global_pred_t_norm={_gp_norm:.4f}mm  global_gt_t_norm={_gg_norm:.4f}mm  "
+                    f"sanity(local-inv(g[i-1])@g[i])={_sanity:.2e}"
+                )
             h, w = state["image_size"]
             dummy_frames = torch.zeros((1, int(h), int(w)), dtype=dtype, device=device_scan)
             tusrec = compute_tusrec_metrics(
@@ -452,6 +519,18 @@ class RecEvaluator:
             avg_metrics[f"{mode}_wrap_dist"] = loss_sums["wrap_dist"] / loss_count
         if tusrec_rows:
             avg_metrics["tusrec_per_scan"] = self._aggregate_tusrec_rows_by_scan(tusrec_rows)
+
+        # Expose per-scan global transforms for downstream hooks (e.g. VizHook)
+        scan_globals = {
+            sid: {
+                "pred": state["globals_pred"],
+                "gt": state["globals_gt"],
+            }
+            for sid, state in scan_state.items()
+            if "globals_pred" in state and "globals_gt" in state
+        }
+        if scan_globals:
+            avg_metrics["scan_globals"] = scan_globals
 
         for cb in callbacks:
             fn = getattr(cb, "on_end", None)

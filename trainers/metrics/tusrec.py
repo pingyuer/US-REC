@@ -1,10 +1,30 @@
-"""TUS-REC metrics with explicit global/local semantics and score outputs."""
+"""TUS-REC metrics with explicit global/local semantics and score outputs.
+
+Transform conventions used throughout this module
+-------------------------------------------------
+* **Global transform** ``T_{0<-i}`` (aliased ``global_T[i]``):
+  maps a point in frame *i* coordinates to frame-0 coordinates.
+  ``global_T[0] = I``.
+
+* **Local transform** ``T_{i-1<-i}`` (aliased ``T_prev_from_curr[i]``):
+  maps a point in frame *i* to frame *i-1*.
+  ``local_T[0] = I`` (identity placeholder).
+
+The single authoritative accumulation rule is implemented in
+:func:`compose_global_from_local`.  All code paths that need to go from
+local -> global MUST call this function (no ad-hoc loops).
+"""
 
 from __future__ import annotations
 
 from typing import Any, Dict, Optional, Tuple
 
 import torch
+
+# ------------------------------------------------------------------
+# Authoritative compose lives in metrics.compose — import & re-export
+# ------------------------------------------------------------------
+from metrics.compose import compose_global_from_local, local_from_global  # noqa: F401
 
 _COORD_PRINTED = False
 
@@ -146,14 +166,8 @@ def _mean_landmark_error(
     return float((total / count).item())
 
 
-def _local_from_global(transforms: torch.Tensor) -> torch.Tensor:
-    """Convert T_i (frame i -> frame 0) to L_i (frame i -> frame i-1)."""
-    if transforms.shape[0] <= 1:
-        return transforms.clone()
-    inv_prev = torch.linalg.inv(transforms[:-1])
-    local = torch.matmul(inv_prev, transforms[1:])
-    identity = torch.eye(4, device=transforms.device, dtype=transforms.dtype).unsqueeze(0)
-    return torch.cat([identity, local], dim=0)
+# Keep private alias for internal back-compat within this file.
+_local_from_global = local_from_global
 
 
 def _score_from_error(metric: Optional[float], largest: Optional[float], *, eps: float = 1e-8) -> Optional[float]:
@@ -332,4 +346,8 @@ def compute_tusrec_metrics(
     }
 
 
-__all__ = ["compute_tusrec_metrics"]
+__all__ = [
+    "compose_global_from_local",
+    "local_from_global",
+    "compute_tusrec_metrics",
+]

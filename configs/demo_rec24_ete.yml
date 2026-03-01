@@ -1,5 +1,19 @@
 # Demo config for tus-rec-24 S3 freehand reconstruction (ETE).
 
+# ---------------------------------------------------------------------------
+# Reproducibility
+# ---------------------------------------------------------------------------
+seed: 0
+
+# ---------------------------------------------------------------------------
+# Paths (all filesystem writes reference these — no hardcoded relative paths)
+# ---------------------------------------------------------------------------
+paths:
+  output_dir: logs
+  log_dir: null
+  ckpt_dir: null
+  cache_dir: null
+
 model:
   name: efficientnet_b1
   pred_type: parameter
@@ -103,6 +117,19 @@ trainer:
     val_loss_min_reg: 1e10
     option: common_volume
 
+# ---------------------------------------------------------------------------
+# Sampling limits (set via CLI --max-scans / --max-frames for smoke tests)
+# ---------------------------------------------------------------------------
+data:
+  max_scans: null
+  max_frames_per_scan: null
+
+train:
+  max_steps: null
+
+eval:
+  max_scans: null
+
 logging:
   mlflow:
     enabled: true
@@ -122,3 +149,36 @@ logging:
 runtime:
   gpu_ids: "0"
   multi_gpu: false
+
+# ---------------------------------------------------------------------------
+# Checkpoint loading (MLflow-first, local fallback)
+# ---------------------------------------------------------------------------
+checkpoint:
+  # --- MLflow source ---
+  # Pin a specific MLflow run ID to load from.  null = auto-search best run.
+  mlflow_run_id: null
+  # Artifact sub-path inside the run (MLflowHook saves here).
+  mlflow_artifact: "checkpoints/best"
+  # When mlflow_run_id is null, search the experiment for the best finished run.
+  mlflow_search_best: true
+
+  # --- Local fallback (used when MLflow is unreachable or disabled) ---
+  # Explicit .pt file path; null = auto-scan <run_dir>/checkpoints/best_*.pt
+  local_path: null
+
+  # --- Behaviour ---
+  load_on_eval: true      # load before --eval-only
+  load_on_resume: true    # load when retain_epoch > 0 (training resume)
+  strict: true            # strict=True for load_state_dict
+
+# ---------------------------------------------------------------------------
+# Visualisation (VizHook)
+# ---------------------------------------------------------------------------
+viz:
+  enabled: true
+  drift_curve: true    # GPE/LPE per-frame drift curve (pred vs gt)
+  pose_curve: true     # translation norm & rotation angle vs frame
+  recon_slices: false  # axial/sagittal/coronal slices (only if volume available)
+  save_png: true
+  save_csv: true
+  out_dir: null        # null → <run_dir>/viz/

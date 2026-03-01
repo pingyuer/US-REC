@@ -1,11 +1,21 @@
-"""Optimizer builder factory."""
+"""Component builders for optimizers and training infrastructure."""
+
+import importlib
+import inspect
+import os
+from collections import defaultdict
+from pathlib import Path
+from typing import Any, Iterable, Optional, Sequence, Union
 
 import torch
-from typing import Any, Union
-
+from omegaconf import DictConfig, OmegaConf
 from torch.optim import SGD, Adam, AdamW, RMSprop
 from torch.optim.optimizer import Optimizer
-from omegaconf import DictConfig, OmegaConf
+from torch.utils.tensorboard import SummaryWriter
+
+from data.builder import build_dataset
+from trainers.context import TrainingContext
+from trainers.hooks import LoggerHook, MLflowHook, VizHook
 
 
 # Optimizer registry for easy extension
@@ -126,3 +136,199 @@ def build_optimizer(
     )
 
     return optimizer
+
+
+def load_dotenv(path: str = ".env", *, override: bool = False) -> None:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        return
+
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip("'").strip('"')
+        if not key:
+            continue
+        if not override and key in os.environ:
+            continue
+        os.environ[key] = value
+
+
+def _resolve_class(name_or_obj: Any):
+    if not isinstance(name_or_obj, str):
+        return name_or_obj
+    module, cls_name = name_or_obj.rsplit(".", 1)
+    mod = importlib.import_module(module)
+    return getattr(mod, cls_name)
+
+
+def build_datasets(cfg: Any) -> tuple[Any, Any, Any]:
+    return (
+        build_dataset(cfg, split="train"),
+        build_dataset(cfg, split="val"),
+        build_dataset(cfg, split="test"),
+    )
+
+
+def build_training_context(cfg: Any, *, root_dir: str | None = None) -> TrainingContext:
+    root = root_dir or OmegaConf.select(cfg, "paths.output_dir") or "logs"
+    return TrainingContext.from_cfg(cfg, root_dir=root)
+
+
+def resolve_run_dirs(cfg: Any, ctx: TrainingContext) -> dict[str, Path]:
+    paths_cfg = OmegaConf.select(cfg, "paths") or {}
+    run_dir = Path(ctx.run_dir)
+    log_dir = Path(paths_cfg.get("log_dir") or (run_dir / "logs"))
+    ckpt_dir = Path(paths_cfg.get("ckpt_dir") or (run_dir / "saved_model"))
+    cache_dir = Path(paths_cfg.get("cache_dir") or (run_dir / "cache"))
+    for path in (log_dir, ckpt_dir, cache_dir):
+        path.mkdir(parents=True, exist_ok=True)
+    return {
+        "run_dir": run_dir,
+        "log_dir": log_dir,
+        "ckpt_dir": ckpt_dir,
+        "cache_dir": cache_dir,
+    }
+
+
+def build_rec_trainer(
+    cfg: Any,
+    save_path: str,
+    dset_train: Any,
+    dset_val: Any,
+    device: torch.device,
+    writer: SummaryWriter,
+) -> Any:
+    # Lazy import to avoid pulling in the full rec_trainer / monai chain at
+    # package import time (breaks tests that only need trainers.metrics).
+    from trainers.rec_trainer import Train_Rec_Reg_Model  # noqa: PLC0415
+    trainer_cfg = OmegaConf.select(cfg, "trainer.rec_trainer") or OmegaConf.select(cfg, "rec_trainer") or {}
+    trainer_cfg = OmegaConf.to_container(trainer_cfg, resolve=True) if trainer_cfg else {}
+    trainer_name = trainer_cfg.pop(
+        "name",
+        OmegaConf.select(cfg, "trainer.name") or "trainers.rec_trainer.Train_Rec_Reg_Model",
+    )
+    TrainerCls = _resolve_class(trainer_name)
+
+    params = {
+        "cfg": cfg,
+        "save_path": save_path,
+        "non_improve_maxmum": trainer_cfg.pop("non_improve_maxmum", 1e10),
+        "reg_loss_weight": trainer_cfg.pop("reg_loss_weight", 1000),
+        "val_loss_min": trainer_cfg.pop("val_loss_min", 1e10),
+        "val_dist_min": trainer_cfg.pop("val_dist_min", 1e10),
+        "val_loss_min_reg": trainer_cfg.pop("val_loss_min_reg", 1e10),
+        "dset_train": dset_train,
+        "dset_val": dset_val,
+        "dset_train_reg": trainer_cfg.pop("dset_train_reg", None),
+        "dset_val_reg": trainer_cfg.pop("dset_val_reg", None),
+        "device": device,
+        "writer": writer,
+        "option": trainer_cfg.pop("option", "common_volume"),
+    }
+
+    signature = inspect.signature(TrainerCls.__init__)
+    allowed = {k for k in signature.parameters if k != "self"}
+    final_params = {k: v for k, v in {**params, **trainer_cfg}.items() if k in allowed}
+    return TrainerCls(**final_params)
+
+
+def build_hooks(cfg: Any, ctx: TrainingContext, trainer: Any = None) -> Sequence[Any]:
+    trainer_cfg = cfg.get("trainer") or {}
+    log_interval = int(trainer_cfg.get("log_interval", 50))
+    hooks: list[Any] = [
+        LoggerHook(
+            interval=log_interval,
+            log_file=str(ctx.log_file),
+            console=True,
+            mlflow_enabled=False,
+            upload_run_dir=False,
+            delete_local_run_dir=False,
+            artifact_path="run",
+        ),
+        MLflowHook(cfg=cfg),
+    ]
+
+    viz_cfg = OmegaConf.select(cfg, "viz") or {}
+    viz_enabled = bool(viz_cfg.get("enabled", False))
+    if viz_enabled:
+        out_dir = viz_cfg.get("out_dir", None)
+        hooks.append(
+            VizHook(
+                out_dir=out_dir,
+                drift_curve=bool(viz_cfg.get("drift_curve", True)),
+                pose_curve=bool(viz_cfg.get("pose_curve", True)),
+                recon_slices=bool(viz_cfg.get("recon_slices", False)),
+                save_png=bool(viz_cfg.get("save_png", True)),
+                save_csv=bool(viz_cfg.get("save_csv", True)),
+                trainer=trainer,
+            )
+        )
+
+    return hooks
+
+
+def _scan_id_from_sample(sample: Any, sample_index: int) -> str:
+    meta = None
+    if isinstance(sample, dict):
+        meta = sample.get("meta")
+    if isinstance(meta, dict):
+        value = meta.get("scan_id") or meta.get("scan_name")
+    elif isinstance(meta, list) and meta:
+        first = meta[0]
+        if isinstance(first, dict):
+            value = first.get("scan_id") or first.get("scan_name")
+        else:
+            value = None
+    else:
+        value = None
+    if isinstance(value, (list, tuple)):
+        value = "/".join(str(v) for v in value)
+    if value is None:
+        value = f"sample_{sample_index}"
+    return str(value)
+
+
+class _SampleLimiter(torch.utils.data.IterableDataset):
+    def __init__(
+        self,
+        dataset: Iterable,
+        max_scans: Optional[int] = None,
+        max_frames_per_scan: Optional[int] = None,
+    ) -> None:
+        self.dataset = dataset
+        self.max_scans = max_scans
+        self.max_frames_per_scan = max_frames_per_scan
+
+    def __iter__(self):
+        counts: dict[str, int] = {}
+        total = 0
+        for sample in iter(self.dataset):
+            sid = _scan_id_from_sample(sample, total)
+            if sid not in counts:
+                if self.max_scans is not None and len(counts) >= self.max_scans:
+                    break
+                counts[sid] = 0
+            if self.max_frames_per_scan is not None and counts[sid] >= self.max_frames_per_scan:
+                continue
+            counts[sid] += 1
+            total += 1
+            yield sample
+
+
+def limit_dataset(
+    dataset: Iterable,
+    *,
+    max_scans: Optional[int] = None,
+    max_frames_per_scan: Optional[int] = None,
+) -> Iterable:
+    if max_scans is None and max_frames_per_scan is None:
+        return dataset
+    return _SampleLimiter(dataset, max_scans=max_scans, max_frames_per_scan=max_frames_per_scan)

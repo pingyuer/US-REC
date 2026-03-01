@@ -20,6 +20,9 @@ from .functional import iou_score
 from .edge import edge_f1score
 from .segmentation import ConfusionMatrix
 
+# Authoritative compose helpers — single source: metrics.compose
+from metrics.compose import compose_global_from_local, local_from_global  # noqa: F401
+
 __all__ = [
     "translation_error_mm",
     "rotation_error_deg",
@@ -36,6 +39,8 @@ __all__ = [
     "ddf_mae_all_dims",
     "ddf_epe_vox",
     "ddf_epe_mm",
+    "compose_global_from_local",
+    "local_from_global",
     "compute_tusrec_metrics",
     "volume_ssim",
     "volume_ncc",

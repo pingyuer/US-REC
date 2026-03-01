@@ -31,7 +31,40 @@ python main.py --config configs/demo_tui.yml
 python main_rec.py --config configs/demo_rec24_ete.yml
 python main_rec.py --config configs/demo_rec24_meta.yml
 ```
-命令会从配置加载参数，并在 `models_all/.../config.txt` 中写入最终设置，保持历史恢复脚本的习惯。
+
+### 快速评测 & 诊断
+```bash
+# 抽样评测（1 scan, 10 frames）
+python main_rec.py --config configs/demo_rec24_ete.yml --eval-only --max-scans 1 --max-frames 10
+
+# Dry-run：验证组件构建 + 数据可读
+python main_rec.py --config configs/demo_rec24_ete.yml --dry-run
+
+# 统一评测入口
+python -m eval.run_eval --config configs/demo_rec24_ete.yml --eval-only --export-json
+```
+
+### Smoke Tests（抽样测试，< 5 分钟）
+```bash
+# 运行所有 smoke tests
+pytest -m smoke
+
+# 运行全量 / 慢速测试（可选）
+pytest -m slow
+
+# 只跑 compose 方向校验
+pytest tests/smoke/test_smoke_compose_global_direction.py -v
+```
+
+### 关键架构说明
+
+| 关注点 | 唯一入口 |
+|--------|----------|
+| Metrics（所有指标） | `trainers/metrics/` — 其他模块仅 import 此处 |
+| Global/Local compose | `metrics/compose.py` — 权威实现 |
+| 评测 & 导出 | `eval/run_eval.py` + `eval/export.py` |
+| 可视化 | `viz/pose_curve.py`, `viz/drift_curve.py`, `viz/recon_slices.py` |
+| 采样限制 | config `data.max_scans` / `data.max_frames_per_scan` / `eval.max_scans` |
 
 ## 📖 文档导航
 
@@ -43,12 +76,25 @@ python main_rec.py --config configs/demo_rec24_meta.yml
 ```
 ├── configs/              配置文件（YAML）
 ├── data/                数据加载和预处理
+├── eval/                统一评测与导出入口
+│   ├── run_eval.py      单入口 --eval-only / --dry-run
+│   ├── builder.py       评测组件构建
+│   └── export.py        per-scan JSON / NPZ 导出
+├── metrics/             全局指标（权威 compose 实现）
+│   ├── compose.py       compose_global_from_local / local_from_global
+│   └── __init__.py      统一 re-export
 ├── models/              模型定义和损失函数
-├── trainers/            训练框架和 Hooks
+├── trainers/            训练框架、Hooks、Metrics
+│   └── metrics/         指标具体实现（pose/trajectory/volume/tusrec…）
 ├── utils/               工具函数和可视化
+├── viz/                 可视化与诊断导出
+│   ├── pose_curve.py    平移/旋转 vs 帧号
+│   ├── drift_curve.py   GPE vs 帧号 drift 曲线
+│   └── recon_slices.py  重建体切片导出
 ├── tests/               单元和集成测试
-├── docs/                详细文档
-├── main.py              训练入口
+│   └── smoke/           快速抽样 smoke tests（pytest -m smoke）
+├── main.py              分割训练入口
+├── main_rec.py          TUS-REC 训练/评测 CLI
 └── requirements.txt     依赖包列表
 ```
 
