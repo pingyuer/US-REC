@@ -11,7 +11,6 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 from torch.optim import SGD, Adam, AdamW, RMSprop
 from torch.optim.optimizer import Optimizer
-from torch.utils.tensorboard import SummaryWriter
 
 from data.builder import build_dataset
 from trainers.context import TrainingContext
@@ -204,7 +203,7 @@ def build_rec_trainer(
     dset_train: Any,
     dset_val: Any,
     device: torch.device,
-    writer: SummaryWriter,
+    writer: Any = None,
 ) -> Any:
     # Lazy import to avoid pulling in the full rec_trainer / monai chain at
     # package import time (breaks tests that only need trainers.metrics).
@@ -243,6 +242,10 @@ def build_rec_trainer(
 def build_hooks(cfg: Any, ctx: TrainingContext, trainer: Any = None) -> Sequence[Any]:
     trainer_cfg = cfg.get("trainer") or {}
     log_interval = int(trainer_cfg.get("log_interval", 50))
+
+    # Build MLflowHook first so its logger can be shared with VizHook.
+    mlflow_hook = MLflowHook(cfg=cfg)
+
     hooks: list[Any] = [
         LoggerHook(
             interval=log_interval,
@@ -253,7 +256,7 @@ def build_hooks(cfg: Any, ctx: TrainingContext, trainer: Any = None) -> Sequence
             delete_local_run_dir=False,
             artifact_path="run",
         ),
-        MLflowHook(cfg=cfg),
+        mlflow_hook,
     ]
 
     viz_cfg = OmegaConf.select(cfg, "viz") or {}
@@ -269,6 +272,7 @@ def build_hooks(cfg: Any, ctx: TrainingContext, trainer: Any = None) -> Sequence
                 save_png=bool(viz_cfg.get("save_png", True)),
                 save_csv=bool(viz_cfg.get("save_csv", True)),
                 trainer=trainer,
+                logger=mlflow_hook.logger,
             )
         )
 

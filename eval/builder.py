@@ -12,7 +12,6 @@ from typing import Any
 
 import torch
 from omegaconf import OmegaConf
-from torch.utils.tensorboard import SummaryWriter
 
 from data.builder import build_dataset
 from trainers.builder import (
@@ -46,6 +45,7 @@ def build_evaluator(cfg: Any) -> dict[str, Any]:
     if gpu_ids:
         os.environ.setdefault("CUDA_VISIBLE_DEVICES", str(gpu_ids))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    writer = None  # MLflow is the primary logging backend; no TensorBoard
 
     # Datasets — apply sampling limits
     max_scans = OmegaConf.select(cfg, "eval.max_scans")
@@ -59,8 +59,6 @@ def build_evaluator(cfg: Any) -> dict[str, Any]:
         dset_test = limit_dataset(
             dset_test, max_scans=max_scans, max_frames_per_scan=max_frames
         )
-
-    writer = SummaryWriter(str(dirs["log_dir"] / "tb"))
 
     trainer = build_rec_trainer(
         cfg,

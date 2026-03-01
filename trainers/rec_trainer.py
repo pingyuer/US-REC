@@ -562,13 +562,15 @@ class Train_Rec_Reg_Model:
                         'epoch_loss_val_reg': epoch_loss_val_reg,
                         'epoch_loss_val_rec': epoch_loss_val_rec,
                     }
-                    add_scalars_rec_volume(self.writer, epoch, loss_dists)
+                    if self.writer is not None:
+                        add_scalars_rec_volume(self.writer, epoch, loss_dists)
 
                     dist_wrap = {
                         'train_wrap_dist': train_epoch_wrap_dist,
                         'val_wrap_dist': epoch_wrap_dist_val,
                     }
-                    add_scalars_wrap_dist(self.writer, epoch, dist_wrap, 'rec_reg')
+                    if self.writer is not None:
+                        add_scalars_wrap_dist(self.writer, epoch, dist_wrap, 'rec_reg')
 
                     self.call_hooks(
                         "after_val",

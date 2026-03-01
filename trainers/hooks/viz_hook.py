@@ -33,6 +33,7 @@ from typing import Any, Optional, Union
 
 from .base_hook import Hook
 from .registry import register_hook
+from utils.loggers import BaseExperimentLogger, NoOpExperimentLogger
 
 
 @register_hook("VizHook")
@@ -51,6 +52,7 @@ class VizHook(Hook):
         save_png: bool = True,
         save_csv: bool = True,
         trainer: Any = None,
+        logger: Optional[BaseExperimentLogger] = None,
     ) -> None:
         self.out_dir = Path(out_dir) if out_dir else None
         self.drift_curve = drift_curve
@@ -59,6 +61,7 @@ class VizHook(Hook):
         self.save_png = save_png
         self.save_csv = save_csv
         self.trainer = trainer  # set by build_hooks or main_rec
+        self.logger: BaseExperimentLogger = logger or NoOpExperimentLogger()
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -88,42 +91,51 @@ class VizHook(Hook):
         tform_calib = getattr(trainer_obj, "tform_calib", None) if trainer_obj else None
         image_points = getattr(trainer_obj, "image_points", None) if trainer_obj else None
 
+        # Maps local file path → MLflow artifact sub-path
+        mlflow_files: dict[str, str] = {}
         written_dirs: list[str] = []
 
         for sid, sg in scan_globals.items():
             pred_global = sg["pred"]
             gt_global = sg["gt"]
-            out_dir = base_out / epoch_tag / sid.replace("/", "_")
+            sid_safe = sid.replace("/", "_").replace(" ", "_")
+            out_dir = base_out / epoch_tag / sid_safe
+            mlflow_prefix = f"viz/{mode}/{epoch_tag}/{sid_safe}"
 
             # ---- pose curve (pred only) --------------------------------
             if self.pose_curve:
                 try:
-                    from viz.pose_curve import export_pose_curve
+                    from viz.pose_curve import export_pose_curve  # noqa: PLC0415
                     result = export_pose_curve(
                         pred_global,
                         out_dir=out_dir,
-                        scan_id=sid,
+                        scan_id=sid_safe,
                         save_png=self.save_png,
                         save_csv=self.save_csv,
                     )
                     written_dirs.append(str(out_dir))
+                    for fpath in (result or {}).values():
+                        mlflow_files[str(fpath)] = mlflow_prefix
                 except Exception as exc:
                     print(f"[VizHook] pose_curve failed for '{sid}': {exc}")
 
             # ---- drift curve (pred vs gt) ------------------------------
             if self.drift_curve and tform_calib is not None:
                 try:
-                    from viz.drift_curve import export_drift_curve
-                    export_drift_curve(
+                    from viz.drift_curve import export_drift_curve  # noqa: PLC0415
+                    result = export_drift_curve(
                         pred_global,
                         gt_global,
                         tform_calib,
                         image_points,
                         out_dir=out_dir,
-                        scan_id=sid,
+                        scan_id=sid_safe,
                         save_png=self.save_png,
                         save_csv=self.save_csv,
                     )
+                    written_dirs.append(str(out_dir))
+                    for fpath in (result or {}).values():
+                        mlflow_files[str(fpath)] = mlflow_prefix
                 except Exception as exc:
                     print(f"[VizHook] drift_curve failed for '{sid}': {exc}")
             elif self.drift_curve and tform_calib is None:
@@ -132,19 +144,33 @@ class VizHook(Hook):
             # ---- recon slices (optional; needs volume in scan_globals) --
             if self.recon_slices and "pred_volume" in sg:
                 try:
-                    from viz.recon_slices import export_recon_slices
-                    export_recon_slices(
+                    from viz.recon_slices import export_recon_slices  # noqa: PLC0415
+                    result = export_recon_slices(
                         sg["pred_volume"],
                         gt_volume=sg.get("gt_volume"),
                         out_dir=out_dir,
-                        scan_id=sid,
+                        scan_id=sid_safe,
                     )
+                    written_dirs.append(str(out_dir))
+                    for fpath in (result or {}).values():
+                        mlflow_files[str(fpath)] = mlflow_prefix
                 except Exception as exc:
                     print(f"[VizHook] recon_slices failed for '{sid}': {exc}")
 
         if written_dirs:
             unique = sorted(set(written_dirs))
             print(f"[VizHook] Visualisations written → {'; '.join(unique)}")
+
+        # Upload all written files to MLflow
+        uploaded = 0
+        for fpath, artifact_path in mlflow_files.items():
+            try:
+                self.logger.log_artifact(fpath, artifact_path=artifact_path)
+                uploaded += 1
+            except Exception as exc:
+                print(f"[VizHook] MLflow upload failed for {fpath!r}: {exc}")
+        if uploaded:
+            print(f"[VizHook] {uploaded} file(s) uploaded to MLflow under 'viz/'")
 
     # ------------------------------------------------------------------
     # RecEvaluator callback interface  (on_start / on_batch / on_end)

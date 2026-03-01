@@ -28,7 +28,6 @@ import sys
 
 import torch
 from omegaconf import OmegaConf
-from torch.utils.tensorboard import SummaryWriter
 
 from trainers.builder import (
     build_datasets,
@@ -106,7 +105,6 @@ def main(argv=None) -> int:
     if gpu_ids:
         os.environ.setdefault("CUDA_VISIBLE_DEVICES", str(gpu_ids))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    writer = SummaryWriter(str(dirs["log_dir"] / "tb"))
 
     # 4. Datasets (with optional sampling limits)
     dset_train, dset_val, dset_test = build_datasets(cfg)
@@ -123,7 +121,7 @@ def main(argv=None) -> int:
         dset_train=dset_train,
         dset_val=dset_val,
         device=device,
-        writer=writer,
+        writer=None,
     )
     trainer.ctx = ctx
 
@@ -161,8 +159,11 @@ def main(argv=None) -> int:
         if bool(ckpt_cfg.get("load_on_eval", True)):
             load_checkpoint(trainer.model, cfg, device, ctx=ctx)
 
-        # Build hooks so VizHook (and others) can run after evaluation
+        # Build hooks and start the MLflow run so VizHook can upload artifacts
         eval_hooks = build_hooks(cfg, ctx, trainer=trainer)
+        mlflow_hook = next((h for h in eval_hooks if h.__class__.__name__ == "MLflowHook"), None)
+        if mlflow_hook is not None:
+            mlflow_hook.before_run(trainer, mode="test")
         eval_callbacks = [h for h in eval_hooks if hasattr(h, "on_end")]
 
         evaluator = RecEvaluator(device=device)
@@ -183,6 +184,8 @@ def main(argv=None) -> int:
         out_dir = str(dirs.get("run_dir", "eval_output"))
         export_results(metrics, out_dir=out_dir, save_json=True)
         print(f"\nResults saved to {out_dir}/")
+        if mlflow_hook is not None:
+            mlflow_hook.after_run(trainer, mode="test")
         return 0
 
     # 6. Normal training path
