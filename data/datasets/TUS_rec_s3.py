@@ -1,6 +1,7 @@
 import concurrent.futures
 import random
 import threading
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Tuple
@@ -49,6 +50,8 @@ class TUSRecS3Iterable(torch.utils.data.IterableDataset):
         prefetch_slices: int = 0,
         buffer_emit_prob: float = 0.5,
         seed: int = 0,
+        mode: str = "train",
+        augment_direction_flip: bool = False,
         pipeline=None,
         **_unused,
     ):
@@ -68,6 +71,8 @@ class TUSRecS3Iterable(torch.utils.data.IterableDataset):
         self.prefetch_slices = max(0, int(prefetch_slices or 0))
         self.buffer_emit_prob = float(buffer_emit_prob)
         self.seed = int(seed)
+        self.mode = str(mode).lower()
+        self.augment_direction_flip = bool(augment_direction_flip)
         self.pipeline = pipeline
         self.epoch = 0
 
@@ -173,11 +178,33 @@ class TUSRecS3Iterable(torch.utils.data.IterableDataset):
     def _iter_loaded_slices(
         self, slice_infos: List[SliceInfo], client=None
     ) -> Iterable[Tuple[SliceInfo, torch.Tensor, torch.Tensor]]:
+        _strict = self.mode in ("val", "test")
+        # In eval/test mode retry up to 3 times then propagate the error.
+        # In train mode a single attempt is sufficient; failures are silently skipped.
+        _max_retries = 3 if _strict else 1
+
+        def _load(info: SliceInfo) -> Tuple[torch.Tensor, torch.Tensor]:
+            last_exc: Optional[Exception] = None
+            for attempt in range(_max_retries):
+                try:
+                    return self._load_slice(info, client=client)
+                except Exception as exc:
+                    last_exc = exc
+                    if attempt < _max_retries - 1:
+                        time.sleep(0.5 * (2 ** attempt))  # 0.5 s, 1 s, …
+            if _strict:
+                raise RuntimeError(
+                    f"[eval] Failed to load {info.frame_key!r} after {_max_retries} attempt(s): {last_exc}"
+                ) from last_exc
+            raise last_exc  # type: ignore[misc]  # train path: caught below
+
         if self.prefetch_slices <= 0:
             for info in slice_infos:
                 try:
-                    frames_t, tforms_t = self._load_slice(info, client=client)
+                    frames_t, tforms_t = _load(info)
                 except Exception:
+                    if _strict:
+                        raise
                     continue
                 yield info, frames_t, tforms_t
             return
@@ -189,7 +216,7 @@ class TUSRecS3Iterable(torch.utils.data.IterableDataset):
                 info = next(info_iter, None)
                 if info is None:
                     break
-                futures[executor.submit(self._load_slice, info, client=client)] = info
+                futures[executor.submit(_load, info)] = info
             while futures:
                 done, _ = concurrent.futures.wait(
                     futures,
@@ -201,11 +228,13 @@ class TUSRecS3Iterable(torch.utils.data.IterableDataset):
                     try:
                         frames_t, tforms_t = future.result()
                     except Exception:
+                        if _strict:
+                            raise
                         frames_t, tforms_t = None, None
                     next_info = next(info_iter, None)
                     if next_info is not None:
                         try:
-                            futures[executor.submit(self._load_slice, next_info, client=client)] = next_info
+                            futures[executor.submit(_load, next_info)] = next_info
                         except RuntimeError:
                             break
                     if frames_t is None:
@@ -230,6 +259,17 @@ class TUSRecS3Iterable(torch.utils.data.IterableDataset):
             frames_pair = frames_t[idx : idx + 2].clone()
             tforms_pair = tforms_t[idx : idx + 2].clone()
             tforms_inv_pair = tforms_inv[idx : idx + 2].clone()
+            frame_idx0 = int(idx)
+            frame_idx1 = int(idx + 1)
+
+            # Direction-flip augmentation (training only): with p=0.5 swap the
+            # pair order so the model learns motion in both scan directions.
+            if self.augment_direction_flip and rng.random() < 0.5:
+                frames_pair = frames_pair.flip(0).clone()
+                tforms_pair = tforms_pair.flip(0).clone()
+                tforms_inv_pair = torch.linalg.inv(tforms_pair)
+                frame_idx0, frame_idx1 = frame_idx1, frame_idx0
+
             yield {
                 "frames": frames_pair,
                 "tforms": tforms_pair,
@@ -238,8 +278,8 @@ class TUSRecS3Iterable(torch.utils.data.IterableDataset):
                     "scan_id": f"{info.subject}/{info.scan_name}",
                     "scan_name": info.scan_name,
                     "subject": info.subject,
-                    "frame_idx0": int(idx),
-                    "frame_idx1": int(idx + 1),
+                    "frame_idx0": frame_idx0,
+                    "frame_idx1": frame_idx1,
                     "pair_mode": self.pair_mode,
                 },
             }

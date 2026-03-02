@@ -436,6 +436,30 @@ class RecEvaluator:
                 continue
             dtype = next(iter(locals_gt.values())).dtype
             device_scan = next(iter(locals_gt.values())).device
+            # --- Frame-gap check: missing frames are filled with identity, which
+            # causes the global trajectory to be wrong and GPE to explode.
+            # Warn loudly so the user knows shuffle/IO settings need fixing.
+            def _check_frame_gaps(local_by_frame: dict, scan_id: str, role: str) -> None:
+                if not local_by_frame:
+                    return
+                max_f = max(int(k) for k in local_by_frame.keys())
+                expected = set(range(1, max_f + 1))
+                present = set(int(k) for k in local_by_frame.keys())
+                missing = sorted(expected - present)
+                if missing:
+                    pct = 100.0 * len(missing) / max_f if max_f > 0 else 0.0
+                    gap_str = str(missing[:10]) + ("..." if len(missing) > 10 else "")
+                    print(
+                        f"[WARNING] scan={scan_id!r} {role}: {len(missing)}/{max_f} frames"
+                        f" ({pct:.1f}%) have no local transform → filled with identity (no-motion)."
+                        f" Missing frame indices: {gap_str}."
+                        f" This will corrupt the global trajectory and inflate GPE."
+                        f" Check shuffle_slices/shuffle_pairs or IO errors.",
+                        flush=True,
+                    )
+
+            _check_frame_gaps(locals_gt, sid, "GT")
+            _check_frame_gaps(locals_pred, sid, "pred")
             gt_global = self._compose_global_from_locals(locals_gt, dtype=dtype, device=device_scan)
             pred_global = self._compose_global_from_locals(locals_pred, dtype=dtype, device=device_scan)
             num_frames = int(min(gt_global.shape[0], pred_global.shape[0]))

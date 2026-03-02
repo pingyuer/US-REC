@@ -55,11 +55,30 @@ dataset:
   sampling:
     pair_mode: adjacent
     random_pairs_per_slice: null
-    shuffle_slices: true
-    shuffle_pairs: true
-    shuffle_buffer_size: 4096
+    # Per-split settings: shuffle/buffer only in training; eval is deterministic.
+    shuffle_slices:·
+      train: true
+      val: false
+      test: false
+    shuffle_pairs:
+      train: true
+      val: false
+      test: false
+    shuffle_buffer_size:
+      train: 4096
+      val: 0
+      test: 0
+    buffer_emit_prob:
+      train: 1.0
+      val: 1.0
+      test: 1.0
+    # Direction-flip augmentation: swap (A,B) → (B,A) with p=0.5 during training.
+    # Helps the model generalise motion estimation to both scan directions.
+    augment_direction_flip:
+      train: true
+      val: false
+      test: false
     prefetch_slices: 4
-    buffer_emit_prob: 1.0
     seed: 0
     num_samples: 100
     sample_range: 100
@@ -100,7 +119,7 @@ loss:
 
 trainer:
   name: trainers.rec_trainer.Train_Rec_Reg_Model
-  max_epochs: 5
+  max_epochs: 2
   log_interval: 500
   validate_every: 1
   save_interval: 100

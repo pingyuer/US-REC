@@ -241,8 +241,10 @@ class Train_Rec_Reg_Model:
         if n <= 0:
             return
         diff = (f1_t[:n] - f0_t[:n]).to(torch.long)
-        adjacent = int((diff == 1).sum().item())
-        non_adjacent = int((diff != 1).sum().item())
+        # Accept both forward (diff=+1) and reversed (diff=-1) adjacent pairs;
+        # the direction-flip augmentation intentionally produces diff=-1 pairs.
+        adjacent = int((diff.abs() == 1).sum().item())
+        non_adjacent = int((diff.abs() != 1).sum().item())
         self._pair_audit_checked += int(n)
         self._pair_audit_adjacent += adjacent
         self._pair_audit_non_adjacent += non_adjacent

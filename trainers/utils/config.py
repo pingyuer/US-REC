@@ -66,7 +66,9 @@ def parse_rec_cfg(cfg: Any) -> Dict[str, Any]:
     out["meta"] = get_cfg_value(cfg, "trainer.mode.meta")
     out["retain_epoch"] = get_cfg_value(cfg, "trainer.retain_epoch", 0)
     out["NUM_EPOCHS"] = int(get_cfg_value(cfg, "trainer.max_epochs", 1))
-    out["MAX_ITERS"] = get_cfg_value(cfg, "trainer.max_steps")
+    # Accept both `train.max_steps` (top-level training section) and the legacy
+    # `trainer.max_steps` location so either placement in the YAML works.
+    out["MAX_ITERS"] = get_cfg_value(cfg, "train.max_steps") or get_cfg_value(cfg, "trainer.max_steps")
     out["val_fre"] = get_cfg_value(cfg, "trainer.validate_every", 1)
     out["FREQ_INFO"] = int(get_cfg_value(cfg, "trainer.info_interval", get_cfg_value(cfg, "trainer.log_interval", 50)))
     out["FREQ_SAVE"] = int(get_cfg_value(cfg, "trainer.save_interval", 100))

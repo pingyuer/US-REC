@@ -57,6 +57,14 @@ def _parse_args(argv=None):
     p = argparse.ArgumentParser(description="TUS-REC train / eval CLI")
     p.add_argument("--config", required=True, help="YAML config path")
     p.add_argument("--eval-only", action="store_true", help="Run evaluation only (no training)")
+    p.add_argument(
+        "--eval-smoke",
+        action="store_true",
+        help=(
+            "Quick smoke eval: implies --eval-only with max_scans=1 and max_frames_per_scan=10."
+            " Useful for checking the full eval pipeline end-to-end without waiting for all data."
+        ),
+    )
     p.add_argument("--dry-run", action="store_true", help="Build components, read 1 batch, exit")
     p.add_argument("--max-scans", type=int, default=None, help="Limit scans (eval/data)")
     p.add_argument("--max-frames", type=int, default=None, help="Limit frames per scan")
@@ -77,6 +85,13 @@ def _parse_args(argv=None):
 
 def main(argv=None) -> int:
     args = _parse_args(argv)
+    # --eval-smoke is sugar for --eval-only --max-scans 1 --max-frames 10
+    if args.eval_smoke:
+        args.eval_only = True
+        if args.max_scans is None:
+            args.max_scans = 1
+        if args.max_frames is None:
+            args.max_frames = 10
     load_dotenv(".env", override=False)
 
     # 1. Load config + apply CLI overrides
