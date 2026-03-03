@@ -80,10 +80,14 @@ def compose_global_from_local(
         local_pfc = local_T  # already prev_from_curr
 
     # Accumulate: global[i] = global[i-1] @ local_pfc[i]
-    global_T = torch.zeros_like(local_pfc)
-    global_T[:, 0] = torch.eye(4, device=local_T.device, dtype=local_T.dtype)
+    # NOTE: do NOT use in-place writes (global_T[:, i] = ...) here — they bump
+    # the version counter on the shared storage and cause autograd to raise
+    # "modified by an inplace operation" errors when pred_local_T requires grad.
+    eye = torch.eye(4, device=local_T.device, dtype=local_T.dtype)
+    frames: list[torch.Tensor] = [eye.expand(B, 4, 4)]  # (B, 4, 4) — no grad
     for i in range(1, T):
-        global_T[:, i] = torch.matmul(global_T[:, i - 1], local_pfc[:, i])
+        frames.append(torch.matmul(frames[-1], local_pfc[:, i]))
+    global_T = torch.stack(frames, dim=1)  # (B, T, 4, 4)
 
     if not batched:
         global_T = global_T.squeeze(0)

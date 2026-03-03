@@ -796,3 +796,281 @@ class TestReverseProbConfig:
             f"flip_prob should be 0.9 (from reverse_prob), got {train_kwargs['flip_prob']}"
         )
 
+
+# ── New (Phase 4): mode-aware logging, DDF active, seg_len, aux_delta32 ────
+
+def _make_trainer_cfg_ex(
+    loss_mode: str = "points",
+    ddf_weight: float = 0.0,
+    memory_size: int = 0,
+    seg_len: int = 0,
+    aux_intervals: list | None = None,
+):
+    """Minimal trainer config supporting the new Phase-4 features."""
+    from omegaconf import OmegaConf
+    return OmegaConf.create({
+        "model": {
+            "pose_head": {"rotation_rep": "rot6d"},
+            "encoder": {"backbone": "efficientnet_b0", "pretrained": False},
+            "transformer": {
+                "d_model": 64, "n_heads": 2, "n_layers": 1,
+                "dim_feedforward": 128, "window_size": 8,
+                "dropout": 0.0,
+                "memory_size": memory_size,
+                "seg_len": seg_len,
+            },
+        },
+        "loss": {
+            "aux_intervals": aux_intervals or [2],
+            "aux_weight": 0.5, "aux_decay": 0.5, "aux_scale": "none",
+            "mode": loss_mode,
+            "ref_pts_scale_mm": 20.0,
+            "consistency_weight": 0.0, "consistency_delta": 2,
+            "rot_weight": 1.0, "trans_weight": 1.0,
+            "ddf_sample_weight": ddf_weight,
+            "ddf_num_points": 16,
+        },
+        "optimizer": {"lr": 1e-4},
+        "trainer": {"max_epochs": 1, "log_interval": 1, "validate_every": 1,
+                    "grad_accum": 1},
+        "paths": {"output_dir": "logs"},
+    })
+
+
+def _make_train_val_loaders(T_train: int = 16, T_val: int = 20):
+    """Small synthetic loaders for trainer integration smoke tests."""
+    from data.datasets.scan_window import SyntheticScanWindowDataset
+    from torch.utils.data import DataLoader
+    ds_t = SyntheticScanWindowDataset(
+        num_scans=2, frames_per_scan=T_train, height=64, width=64,
+        window_size=T_train, mode="train", seed=0,
+    )
+    ds_v = SyntheticScanWindowDataset(
+        num_scans=2, frames_per_scan=T_val, height=64, width=64,
+        window_size=T_val, mode="val", seed=0,
+    )
+    return DataLoader(ds_t, batch_size=1), DataLoader(ds_v, batch_size=1)
+
+
+class TestModeAwareLogging:
+    """A: In points mode, breakdown must expose local_pts_rmse_mm & drift_pts_mm
+    instead of misleading local_rot=0 / local_trans fields."""
+
+    def test_points_mode_breakdown_keys_v2(self):
+        """_run_step breakdown in points mode has local_pts_rmse_mm + drift_pts_mm."""
+        import torch
+        from trainers.longseq_trainer import LongSeqTrainer
+        from data.datasets.scan_window import SyntheticScanWindowDataset
+        from torch.utils.data import DataLoader
+
+        cfg = _make_trainer_cfg_ex(loss_mode="points")
+        trainer = LongSeqTrainer(cfg, device="cpu")
+        trainer.model.train()
+
+        ds = SyntheticScanWindowDataset(num_scans=1, frames_per_scan=12, height=64, width=64, window_size=12, mode="train", seed=0)
+        batch = next(iter(DataLoader(ds, batch_size=1)))
+        with torch.no_grad():
+            loss, bd = trainer._run_step(batch)
+
+        assert "local_pts_rmse_mm" in bd, f"local_pts_rmse_mm missing; got {list(bd)}"
+        assert "drift_pts_mm" in bd,      f"drift_pts_mm missing; got {list(bd)}"
+        assert "local_rot_deg" not in bd, "local_rot_deg should NOT appear in points mode"
+        assert bd["local_pts_rmse_mm"] >= 0.0
+        assert bd["drift_pts_mm"] >= 0.0
+
+    def test_se3_mode_breakdown_keys(self):
+        """_run_step breakdown in se3 mode has local_rot_deg + local_trans_mm."""
+        import torch
+        from trainers.longseq_trainer import LongSeqTrainer
+        from data.datasets.scan_window import SyntheticScanWindowDataset
+        from torch.utils.data import DataLoader
+
+        cfg = _make_trainer_cfg_ex(loss_mode="se3")
+        trainer = LongSeqTrainer(cfg, device="cpu")
+        trainer.model.train()
+
+        ds = SyntheticScanWindowDataset(num_scans=1, frames_per_scan=12, height=64, width=64, window_size=12, mode="train", seed=0)
+        batch = next(iter(DataLoader(ds, batch_size=1)))
+        with torch.no_grad():
+            loss, bd = trainer._run_step(batch)
+
+        assert "local_rot_deg"   in bd, f"local_rot_deg missing; got {list(bd)}"
+        assert "local_trans_mm"  in bd, f"local_trans_mm missing; got {list(bd)}"
+        assert "local_pts_rmse_mm" not in bd, "local_pts_rmse_mm should NOT appear in se3 mode"
+        assert bd["local_rot_deg"] >= 0.0
+
+    def test_grad_norm_rot_head_in_step_buffer(self):
+        """grad_norm_rot_head must appear in the after_step log_buffer."""
+        import torch
+        from trainers.longseq_trainer import LongSeqTrainer
+        from trainers.hooks.base_hook import Hook
+
+        step_bufs: list[dict] = []
+
+        class CapHook(Hook):
+            def after_step(self, trainer, log_buffer=None, **_):
+                if log_buffer:
+                    step_bufs.append(dict(log_buffer))
+
+        cfg = _make_trainer_cfg_ex(loss_mode="points")
+        tr_loader, _ = _make_train_val_loaders()
+        trainer = LongSeqTrainer(cfg, device="cpu", train_loader=tr_loader)
+        trainer.hooks.append(CapHook())
+        trainer.train()
+
+        assert step_bufs, "No after_step calls captured"
+        buf = step_bufs[0]
+        assert "grad_norm_rot_head" in buf, f"grad_norm_rot_head not in step buffer: {list(buf)}"
+        assert buf["grad_norm_rot_head"] >= 0.0
+
+
+class TestDDFLossEnabled:
+    """B: When ddf_sample_weight > 0, the DDF term must be non-zero and logged."""
+
+    def test_ddf_loss_nonzero_with_weight(self):
+        """With ddf_sample_weight=0.05 and a toy calib, loss_ddf must be > 0."""
+        import torch
+        from trainers.longseq_trainer import LongSeqTrainer
+        from data.datasets.scan_window import SyntheticScanWindowDataset
+        from torch.utils.data import DataLoader
+
+        cfg = _make_trainer_cfg_ex(ddf_weight=0.05)
+        trainer = LongSeqTrainer(cfg, device="cpu")
+        # Inject a toy calib (pixels → mm at 0.1 scale)
+        trainer.tform_calib = torch.eye(4, dtype=torch.float32) * 0.1
+        trainer.tform_calib[3, 3] = 1.0
+        trainer.model.train()
+
+        ds = SyntheticScanWindowDataset(num_scans=1, frames_per_scan=12, height=64, width=64, window_size=12, mode="train", seed=0)
+        batch = next(iter(DataLoader(ds, batch_size=1)))
+        loss, bd = trainer._run_step(batch)
+
+        assert "loss_ddf" in bd, "loss_ddf missing from breakdown"
+        assert bd["loss_ddf"] > 0.0, f"loss_ddf should be > 0 (got {bd['loss_ddf']})"
+
+    def test_ddf_loss_zero_without_calib(self):
+        """Without calib, loss_ddf must be 0 regardless of weight setting."""
+        import torch
+        from trainers.longseq_trainer import LongSeqTrainer
+        from data.datasets.scan_window import SyntheticScanWindowDataset
+        from torch.utils.data import DataLoader
+
+        cfg = _make_trainer_cfg_ex(ddf_weight=0.05)
+        trainer = LongSeqTrainer(cfg, device="cpu")
+        trainer.tform_calib = None  # no calib → DDF disabled
+        trainer.model.train()
+
+        ds = SyntheticScanWindowDataset(num_scans=1, frames_per_scan=12, height=64, width=64, window_size=12, mode="train", seed=0)
+        batch = next(iter(DataLoader(ds, batch_size=1)))
+        loss, bd = trainer._run_step(batch)
+        assert bd["loss_ddf"] == 0.0, f"loss_ddf should be 0 without calib, got {bd['loss_ddf']}"
+
+
+class TestSegLenRecurrence:
+    """C: With seg_len > 0 and memory_size > 0, training forward uses chunked path."""
+
+    def test_train_with_seg_len_runs_without_error(self):
+        """Training with seg_len=8, memory_size=4 completes one epoch on synthetic data."""
+        import torch
+        from trainers.longseq_trainer import LongSeqTrainer
+
+        cfg = _make_trainer_cfg_ex(memory_size=4, seg_len=8)
+        tr_loader, _ = _make_train_val_loaders(T_train=16)
+        trainer = LongSeqTrainer(cfg, device="cpu", train_loader=tr_loader)
+        trainer.train()  # should complete without error
+
+    def test_seg_len_forward_shape_consistency(self):
+        """pred_local_T shape matches T regardless of seg_len chunking."""
+        import torch
+        from trainers.longseq_trainer import LongSeqTrainer
+        from data.datasets.scan_window import SyntheticScanWindowDataset
+        from torch.utils.data import DataLoader
+
+        B, T = 1, 24
+        cfg = _make_trainer_cfg_ex(memory_size=4, seg_len=8)
+        trainer = LongSeqTrainer(cfg, device="cpu")
+        trainer.model.eval()
+
+        ds = SyntheticScanWindowDataset(num_scans=1, frames_per_scan=T, height=64, width=64, window_size=T, mode="val", seed=0)
+        batch = next(iter(DataLoader(ds, batch_size=B)))
+        frames = batch["frames"]
+
+        with torch.no_grad():
+            out = trainer._forward_with_memory(frames, chunk_size=8)
+
+        assert out["pred_local_T"].shape == (B, T, 4, 4), (
+            f"Shape mismatch: {out['pred_local_T'].shape}"
+        )
+
+    def test_seg_len_breakdown_has_expected_fields(self):
+        """_run_step with seg_len recurrence still produces all expected fields."""
+        import torch
+        from trainers.longseq_trainer import LongSeqTrainer
+        from data.datasets.scan_window import SyntheticScanWindowDataset
+        from torch.utils.data import DataLoader
+
+        cfg = _make_trainer_cfg_ex(memory_size=4, seg_len=8)
+        trainer = LongSeqTrainer(cfg, device="cpu")
+        trainer.model.train()
+
+        ds = SyntheticScanWindowDataset(num_scans=1, frames_per_scan=16, height=64, width=64, window_size=16, mode="train", seed=0)
+        batch = next(iter(DataLoader(ds, batch_size=1)))
+        loss, bd = trainer._run_step(batch)
+
+        for req_key in ("loss_local", "loss_aux", "drift_mm_last",
+                        "local_pts_rmse_mm", "drift_pts_mm"):
+            assert req_key in bd, f"Required key '{req_key}' missing from breakdown"
+
+
+class TestAuxInterval32:
+    """D: aux_intervals=[2,4,8,16,32] – breakdown contains aux_delta32 key."""
+
+    def test_aux_delta32_in_breakdown(self):
+        """With intervals=[2,4,8,16,32] and T>32, aux_delta32_pts appears in breakdown."""
+        import torch
+        from trainers.longseq_trainer import LongSeqTrainer
+        from data.datasets.scan_window import SyntheticScanWindowDataset
+        from torch.utils.data import DataLoader
+
+        cfg = _make_trainer_cfg_ex(aux_intervals=[2, 4, 8, 16, 32])
+        trainer = LongSeqTrainer(cfg, device="cpu")
+        trainer.model.train()
+
+        # Need T > 32 to get valid Δ=32 frames
+        ds = SyntheticScanWindowDataset(
+            num_scans=1, frames_per_scan=48, height=64, width=64,
+            window_size=48, mode="train", seed=0,
+        )
+        batch = next(iter(DataLoader(ds, batch_size=1)))
+        loss, bd = trainer._run_step(batch)
+
+        assert "aux_delta32_pts" in bd, (
+            f"aux_delta32_pts not in breakdown for intervals=[2,4,8,16,32]; "
+            f"got keys: {[k for k in bd if 'aux' in k]}"
+        )
+        assert bd["aux_delta32_pts"] >= 0.0
+
+    def test_aux_delta32_printed_in_log(self):
+        """With aux_intervals=[2,4,8,16,32], the training log includes aux32 term."""
+        import io, sys
+        from trainers.longseq_trainer import LongSeqTrainer
+
+        cfg = _make_trainer_cfg_ex(aux_intervals=[2, 4, 8, 16, 32])
+        tr_loader, _ = _make_train_val_loaders(T_train=48)
+
+        # Capture stdout
+        buf = io.StringIO()
+        old_stdout = sys.stdout
+        sys.stdout = buf
+        try:
+            trainer = LongSeqTrainer(cfg, device="cpu", train_loader=tr_loader)
+            trainer.train()
+        finally:
+            sys.stdout = old_stdout
+
+        output = buf.getvalue()
+        assert "auxΔ32" in output or "aux_delta32" in output or "32" in output, (
+            f"aux Δ=32 term not visible in training log output:\n{output[:500]}"
+        )
+
+

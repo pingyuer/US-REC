@@ -62,11 +62,17 @@ model:
     n_heads: 4
     n_layers: 4
     dim_feedforward: 1024
-    window_size: 64
+    window_size: 64          # sliding-window attention span within a segment
     dropout: 0.1
-    # Transformer-XL memory tokens: carry context across segment boundaries.
-    # 0 = disabled (same as original).  Set to 32 or 64 for cross-segment context.
-    memory_size: 0
+    # Transformer-XL style segment recurrence:
+    #   seg_len  — training sequence is split into chunks of this many frames;
+    #              memory tokens are passed between segments (stop-grad).
+    #   mem_len  — documentation alias; maps to memory_size in the model.
+    #   memory_size — number of hidden-state tokens carried cross-segment.
+    #   Set memory_size: 0 to disable (single-pass, original behaviour).
+    seg_len: 128             # frames per training segment (0 = single-pass)
+    mem_len: 32              # alias; matches memory_size below
+    memory_size: 32          # carry 32 context tokens across segment boundaries
 
   # Image dimensions for DDF pixel sampling (H x W)
   image_size_h: 480
@@ -182,9 +188,10 @@ loss:
   trans_weight: 1.0
 
   # Long-sequence multi-interval auxiliary supervision
-  aux_intervals: [2, 4, 8, 16]
+  # Δ=32 adds long-range context aligned with Qi Li's dependency analysis
+  aux_intervals: [2, 4, 8, 16, 32]
   aux_weight: 0.5            # base weight for auxiliary losses
-  aux_decay: 0.5             # multiplicative decay per interval rank
+  aux_decay: 0.5             # multiplicative decay per interval rank; wΔ = aux_weight * decay^rank
   aux_scale: none            # "none" (recommended for points mode) | "delta" | "delta2"
 
   # Points-based loss mode: rotation error is encoded in point displacement,
@@ -194,8 +201,8 @@ loss:
 
   # DDF surrogate loss: sample random pixels, map through calib, apply global T.
   # Matches the TUS-REC evaluation oracle.  Requires dataset.calib_file.
-  # Set ddf_sample_weight: 0.0 to disable (no calib needed).
-  ddf_sample_weight: 0.0     # e.g. 0.1 once calib is confirmed correct
+  # 0.05 is a conservative starting weight; increase to 0.1-0.2 once stable.
+  ddf_sample_weight: 0.05    # was 0.0; set >0 to align training with GPE oracle
   ddf_num_points: 1024       # random pixels per batch
 
   # Consistency constraint

@@ -12,6 +12,7 @@ Usage (from config):
 
 from __future__ import annotations
 
+import math
 import os
 import time
 import warnings
@@ -112,6 +113,11 @@ class LongSeqTrainer:
         self.save_path = str(_cfg_get(cfg, "paths.output_dir", "logs"))
         # Gradient accumulation: accumulate over N micro-batches before stepping.
         self.grad_accum = max(1, int(_cfg_get(cfg, "trainer.grad_accum", 1) or 1))
+        # Segment length for Transformer-XL style recurrence:
+        # split each training sequence into chunks of seg_len and pass memory
+        # tokens between segments.  0 = disabled (single-pass forward).
+        # mem_len is a documentation alias for memory_size (set at model level).
+        self.seg_len = int(_cfg_get(cfg, "model.transformer.seg_len", 0) or 0)
 
     # ── calibration ─────────────────────────────────────────────────
 
@@ -245,7 +251,13 @@ class LongSeqTrainer:
         if frames.max() > 1.1:
             frames = frames / 255.0
 
-        out = self.model(frames)
+        # Use segmented Transformer-XL forward when seg_len and memory are configured.
+        # Within each segment, gradients flow normally; memory tokens are stop-grad
+        # (temporal_transformer.py detaches new_memory before returning).
+        if self.seg_len > 0 and getattr(self.model, "memory_size", 0) > 0:
+            out = self._forward_with_memory(frames, chunk_size=self.seg_len)
+        else:
+            out = self.model(frames)
         pred_local_T = out["pred_local_T"]       # (B, T, 4, 4)
         pred_aux_T = out["pred_aux_T"]           # dict[Δ → (B, T, 4, 4)]
 
@@ -272,11 +284,39 @@ class LongSeqTrainer:
         # Compute per-frame global pose for diagnostics
         with torch.no_grad():
             pred_global = compose_global_from_local(pred_local_T)  # (B, T, 4, 4)
-            # Translation drift at last frame
+            # SE(3) translation drift at last frame
             drift_t = (
                 pred_global[:, -1, :3, 3] - gt_global[:, -1, :3, 3]
             ).norm(dim=-1).mean()
             breakdown["drift_mm_last"] = float(drift_t.item())
+
+            if self.loss_mode == "points":
+                # Points-based drift at last frame (matches GPE evaluation direction)
+                _ref = make_ref_points(
+                    self.ref_pts_scale_mm, device=self.device, dtype=torch.float32
+                )  # (K, 4)
+                _pts_hom = _ref.T  # (4, K)
+                _pred_last = (
+                    pred_global[:, -1] @ _pts_hom
+                )[:, :3, :].permute(0, 2, 1)   # (B, K, 3)
+                _gt_last = (
+                    gt_global[:, -1] @ _pts_hom
+                )[:, :3, :].permute(0, 2, 1)
+                breakdown["drift_pts_mm"] = float(
+                    (_pred_last - _gt_last).norm(dim=-1).mean().item()
+                )
+                # RMSE of local points loss (sqrt of MSE in mm^2 → mm)
+                breakdown["local_pts_rmse_mm"] = float(
+                    breakdown["loss_local"] ** 0.5
+                )
+            else:
+                # SE(3) mode: convert geodesic rotation loss to degrees
+                breakdown["local_rot_deg"] = float(
+                    math.degrees(breakdown["loss_local_rot"])
+                )
+                breakdown["local_trans_mm"] = float(
+                    breakdown["loss_local_trans"] ** 0.5
+                )
 
         return loss, breakdown
 
@@ -325,6 +365,21 @@ class LongSeqTrainer:
                 loss, metrics = self._run_step(batch)
                 (loss / self.grad_accum).backward()
 
+                # ── Gradient norm of rotation head (computed after backward) ─────────
+                # Confirms that gradients flow to the rotation sub-network.
+                _rot_head = getattr(self.model, "local_head", None)
+                if _rot_head is not None:
+                    _rg = [
+                        p.grad.detach().norm()
+                        for p in _rot_head.parameters()
+                        if p.grad is not None
+                    ]
+                    metrics["grad_norm_rot_head"] = (
+                        float(torch.stack(_rg).norm().item()) if _rg else 0.0
+                    )
+                else:
+                    metrics["grad_norm_rot_head"] = 0.0
+
                 should_step = (
                     n_steps % self.grad_accum == 0
                     or (
@@ -340,11 +395,33 @@ class LongSeqTrainer:
                 epoch_loss += float(loss.item())
 
                 if n_steps % self.log_interval == 0 or n_steps == 1:
+                    # Mode-aware logging:
+                    #   points mode → local_pts_rmse_mm + drift_pts_mm
+                    #   se3 mode    → local_rot_deg + local_trans_mm
+                    if self.loss_mode == "points":
+                        _mode_str = (
+                            f"local_pts_rmse={metrics.get('local_pts_rmse_mm', 0.0):.6f}mm  "
+                            f"drift_pts={metrics.get('drift_pts_mm', 0.0):.6f}mm"
+                        )
+                    else:
+                        _mode_str = (
+                            f"local_rot={metrics.get('local_rot_deg', 0.0):.6f}deg  "
+                            f"local_trans={metrics.get('local_trans_mm', 0.0):.6f}mm"
+                        )
+                    # Per-delta aux losses for multi-interval supervision
+                    _aux_parts = "  ".join(
+                        f"auxΔ{d}={metrics.get(f'aux_delta{d}_pts' if self.loss_mode == 'points' else f'aux_delta{d}_rot', 0.0):.5f}"
+                        for d in sorted(self.aux_intervals)
+                        if f"aux_delta{d}_pts" in metrics or f"aux_delta{d}_rot" in metrics
+                    )
                     print(
                         f"[LongSeq epoch {epoch}  step {n_steps}]  "
-                        f"loss={loss.item():.4f}  local_rot={metrics.get('loss_local_rot', 0):.4f}  "
-                        f"local_trans={metrics.get('loss_local_trans', 0):.4f}  "
-                        f"drift_mm={metrics.get('drift_mm_last', 0):.2f}"
+                        f"loss={loss.item():.6f}  {_mode_str}  "
+                        f"ddf={metrics.get('loss_ddf', 0.0):.6f}  "
+                        f"consist={metrics.get('loss_consistency', 0.0):.5f}  "
+                        f"drift_se3={metrics.get('drift_mm_last', 0.0):.3f}mm  "
+                        f"grad_rot={metrics.get('grad_norm_rot_head', 0.0):.5f}"
+                        + (f"  [{_aux_parts}]" if _aux_parts else "")
                     )
 
                 lr = float(self.optimizer.param_groups[0].get("lr", 0.0))
