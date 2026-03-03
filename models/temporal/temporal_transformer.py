@@ -7,11 +7,17 @@ Design choices:
 - Causal masking ensures frame *i* only attends to frames ≤ *i*.
 - Window attention (default w=64) keeps memory linear in T.
 - Sinusoidal positional encoding (easy to extend to rotary later).
+- Optional **Transformer-XL style memory tokens**: cached hidden states
+  from the previous segment are prepended to the current segment as
+  read-only context, enabling cross-segment information flow without
+  re-computing the full scan.  Memory tokens are always detached from
+  the computation graph (recurrence without BPTT).
 """
 
 from __future__ import annotations
 
 import math
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -35,12 +41,12 @@ class SinusoidalPosEmb(nn.Module):
         pe[:, 1::2] = torch.cos(position * div_term)
         self.register_buffer("pe", pe.unsqueeze(0))  # (1, max_len, D)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x : (B, T, D)"""
-        return x + self.pe[:, : x.size(1)]
+    def forward(self, x: torch.Tensor, offset: int = 0) -> torch.Tensor:
+        """x : (B, T, D),  offset : global sequence start position."""
+        return x + self.pe[:, offset : offset + x.size(1)]
 
 
-# ─── Sliding-window causal attention ─────────────────────────────────────────
+# ─── Attention masks ─────────────────────────────────────────────────────────
 
 def _build_sliding_window_causal_mask(
     T: int, window_size: int, device: torch.device
@@ -55,10 +61,49 @@ def _build_sliding_window_causal_mask(
     arange = torch.arange(T, device=device)
     j = arange.unsqueeze(0)   # (1, T) — column / key position
     i = arange.unsqueeze(1)   # (T, 1) — row   / query position
-    # mask[i,j] = True means BLOCK attention from query i to key j.
-    # Causal: block j > i (no attending to future).
-    # Window: block j < i - window_size + 1 (no attending beyond window).
     mask = (j > i) | (j < i - window_size + 1)
+    return mask
+
+
+def _build_memory_causal_mask(
+    T: int, M: int, window_size: int, device: torch.device
+) -> torch.Tensor:
+    """Attention mask for M memory tokens followed by T frame tokens.
+
+    Memory tokens can be used as context by any frame but are not
+    themselves updated (they are detached read-only inputs).
+
+    Layout of the (M+T, M+T) mask (True = blocked):
+    - Memory queries (rows 0..M-1): attend to all earlier/same memory tokens
+      (standard causal attention among memories).
+    - Frame  queries (rows M..M+T-1): can ALWAYS attend to all memory tokens
+      (no window restriction on memory); standard causal sliding window
+      within the T frame tokens.
+    """
+    L = M + T
+    arange = torch.arange(L, device=device)
+    col_j = arange.unsqueeze(0)   # (1, L) — key
+    row_i = arange.unsqueeze(1)   # (L, 1) — query
+
+    # Start with fully blocked
+    mask = torch.ones(L, L, dtype=torch.bool, device=device)
+
+    # Memory-on-memory: causal (j <= i, both < M)
+    mem_q = row_i < M
+    mem_k = col_j < M
+    mask = torch.where(mem_q & mem_k & (col_j <= row_i), torch.zeros_like(mask), mask)
+
+    # Frame-on-memory: always allow (memory is always "past")
+    frame_q = row_i >= M
+    mask = torch.where(frame_q & mem_k, torch.zeros_like(mask), mask)
+
+    # Frame-on-frame: causal sliding window (local coords within T)
+    frame_k = col_j >= M
+    local_i = row_i - M   # offset into frame tokens
+    local_j = col_j - M
+    frame_causal_ok = (local_j <= local_i) & (local_j >= local_i - window_size + 1)
+    mask = torch.where(frame_q & frame_k & frame_causal_ok, torch.zeros_like(mask), mask)
+
     return mask
 
 
@@ -89,23 +134,25 @@ class SlidingWindowTransformerLayer(nn.Module):
         self.norm2 = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
 
-        # Cache mask per sequence length
+        # Cache masks per sequence length
         self._cached_mask: torch.Tensor | None = None
-        self._cached_T: int = -1
+        self._cached_key: tuple[int, int] = (-1, -1)  # (T, M)
 
-    def _get_mask(self, T: int, device: torch.device) -> torch.Tensor:
-        if T != self._cached_T or self._cached_mask is None or self._cached_mask.device != device:
-            self._cached_mask = _build_sliding_window_causal_mask(
-                T, self.window_size, device
-            )
-            self._cached_T = T
+    def _get_mask(self, T: int, device: torch.device, M: int = 0) -> torch.Tensor:
+        key = (T + M, M)
+        if key != self._cached_key or self._cached_mask is None or self._cached_mask.device != device:
+            if M > 0:
+                self._cached_mask = _build_memory_causal_mask(T, M, self.window_size, device)
+            else:
+                self._cached_mask = _build_sliding_window_causal_mask(T, self.window_size, device)
+            self._cached_key = key
         return self._cached_mask
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x : (B, T, D) → (B, T, D)"""
-        T = x.size(1)
-        mask = self._get_mask(T, x.device)
-        # Pre-norm style
+    def forward(self, x: torch.Tensor, M: int = 0) -> torch.Tensor:
+        """x : (B, M+T, D) → (B, M+T, D).  M = number of memory tokens."""
+        L = x.size(1)
+        T = L - M
+        mask = self._get_mask(T, x.device, M=M)
         x2 = self.norm1(x)
         attn_out, _ = self.self_attn(x2, x2, x2, attn_mask=mask)
         x = x + self.dropout(attn_out)
@@ -134,6 +181,11 @@ class TemporalPoseTransformer(nn.Module):
         Sliding-window size for causal attention.
     max_len : int
         Maximum sequence length for positional encoding.
+    memory_size : int
+        Number of memory tokens to carry between segments (Transformer-XL
+        style).  0 disables the memory mechanism (default, trains identically
+        to the original design).  When > 0 the transformer accepts an optional
+        ``memory`` argument and returns ``(ctx, new_memory)`` from ``forward()``.
     """
 
     def __init__(
@@ -145,8 +197,10 @@ class TemporalPoseTransformer(nn.Module):
         dropout: float = 0.1,
         window_size: int = 64,
         max_len: int = 4096,
+        memory_size: int = 0,
     ):
         super().__init__()
+        self.memory_size = max(0, int(memory_size))
         self.pos_emb = SinusoidalPosEmb(d_model, max_len=max_len)
         self.layers = nn.ModuleList(
             [
@@ -162,17 +216,54 @@ class TemporalPoseTransformer(nn.Module):
         )
         self.final_norm = nn.LayerNorm(d_model)
 
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        memory: Optional[torch.Tensor] = None,
+        pos_offset: int = 0,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Parameters
         ----------
-        tokens : (B, T, D) — per-frame feature tokens
+        tokens : (B, T, D) — per-frame feature tokens (current segment)
+        memory : (B, M, D) or None — cached context from previous segment
+            (detached; only used as keys/values via the memory attention mask)
+        pos_offset : int — global position of the first frame token (for
+            sinusoidal PE when processing the sequence in chunks)
 
         Returns
         -------
-        ctx : (B, T, D) — context-enriched tokens
+        ctx : (B, T, D) — context-enriched frame tokens
+        new_memory : (B, M, D) or None — updated memory to pass to the next
+            segment (= last ``memory_size`` ctx tokens, detached).
+            None when ``memory_size == 0``.
         """
-        x = self.pos_emb(tokens)
+        B, T, D = tokens.shape
+        device = tokens.device
+
+        if memory is not None and self.memory_size > 0:
+            # Prepend memory (detached) to frame tokens.
+            # Memory tokens get positional encodings 0..M-1;
+            # frame tokens get encodings pos_offset..pos_offset+T-1.
+            M = memory.size(1)
+            mem_pe = self.pos_emb(memory.detach(), offset=0)          # (B, M, D)
+            tok_pe = self.pos_emb(tokens, offset=pos_offset)          # (B, T, D)
+            x = torch.cat([mem_pe, tok_pe], dim=1)                    # (B, M+T, D)
+        else:
+            M = 0
+            x = self.pos_emb(tokens, offset=pos_offset)               # (B, T, D)
+
         for layer in self.layers:
-            x = layer(x)
-        return self.final_norm(x)
+            x = layer(x, M=M)
+
+        x = self.final_norm(x)
+        ctx = x[:, M:]  # (B, T, D) — only frame positions
+
+        # Build new memory from the last memory_size frame tokens
+        if self.memory_size > 0:
+            take = min(self.memory_size, T)
+            new_memory = ctx[:, -take:].detach()                      # (B, take, D)
+        else:
+            new_memory = None
+
+        return ctx, new_memory

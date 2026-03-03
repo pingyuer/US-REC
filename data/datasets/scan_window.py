@@ -57,6 +57,10 @@ class ScanWindowDataset(torch.utils.data.IterableDataset):
         windows_per_scan: int = 1,
         mode: str = "train",
         seed: int = 0,
+        augment_flip: bool = False,
+        flip_prob: float = 0.5,
+        calib_matrix: Optional[torch.Tensor] = None,
+        image_size: Optional[Tuple[int, int]] = None,
     ):
         super().__init__()
         self._base = base_dataset
@@ -65,6 +69,19 @@ class ScanWindowDataset(torch.utils.data.IterableDataset):
         self.mode = str(mode).lower()
         self.seed = int(seed)
         self.epoch = 0
+        # Time-reversal augmentation: randomly reverse frame order during training.
+        # The local transforms in the reversed sequence at position j equal
+        # inv(original local transform at position T-j), which is physically
+        # equivalent to running the probe in the reverse direction.
+        # After reversing, we normalise so that the new frame-0 = I, and the
+        # normalisation step correctly handles the updated global transforms.
+        self.augment_flip = bool(augment_flip) and self.mode == "train"
+        self.flip_prob = float(flip_prob)
+        # Optional calibration matrix (4x4) and image size for DDF metrics/loss.
+        # When provided these are included in every sample's ``meta`` dict so
+        # the trainer can compute TUS-REC DDF metrics without re-loading calib.
+        self.calib_matrix = calib_matrix  # (4, 4) tensor or None
+        self.image_size = image_size      # (H, W) tuple or None
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
@@ -107,17 +124,22 @@ class ScanWindowDataset(torch.utils.data.IterableDataset):
         if self.mode in ("val", "test"):
             # Full scan — normalise global transforms so frame 0 = I
             gt_global = self._normalise_global_transforms(tforms_t.float())
+            meta: dict = {
+                "scan_id": scan_id,
+                "subject": info.subject,
+                "scan_name": info.scan_name,
+                "window_start": 0,
+                "window_size": T_total,
+                "total_frames": T_total,
+            }
+            if self.calib_matrix is not None:
+                meta["tform_calib"] = self.calib_matrix
+            if self.image_size is not None:
+                meta["image_size"] = list(self.image_size)
             yield {
                 "frames": frames_t.float(),
                 "gt_global_T": gt_global,
-                "meta": {
-                    "scan_id": scan_id,
-                    "subject": info.subject,
-                    "scan_name": info.scan_name,
-                    "window_start": 0,
-                    "window_size": T_total,
-                    "total_frames": T_total,
-                },
+                "meta": meta,
             }
             return
 
@@ -129,18 +151,32 @@ class ScanWindowDataset(torch.utils.data.IterableDataset):
             end = start + W
             win_frames = frames_t[start:end].float().clone()
             win_tforms = tforms_t[start:end].float().clone()
+
+            # Time-reversal augmentation: flip frame order with probability
+            # flip_prob.  Reversing the global transforms along the time
+            # axis and then re-normalising produces the correct local
+            # transforms for the reversed sequence (new_L[j] = inv(old_L[T-j])).
+            if self.augment_flip and rng.random() < self.flip_prob:
+                win_frames = win_frames.flip(0).contiguous()
+                win_tforms = win_tforms.flip(0).contiguous()
+
             gt_global = self._normalise_global_transforms(win_tforms)
+            meta = {
+                "scan_id": scan_id,
+                "subject": info.subject,
+                "scan_name": info.scan_name,
+                "window_start": start,
+                "window_size": W,
+                "total_frames": T_total,
+            }
+            if self.calib_matrix is not None:
+                meta["tform_calib"] = self.calib_matrix
+            if self.image_size is not None:
+                meta["image_size"] = list(self.image_size)
             yield {
                 "frames": win_frames,
                 "gt_global_T": gt_global,
-                "meta": {
-                    "scan_id": scan_id,
-                    "subject": info.subject,
-                    "scan_name": info.scan_name,
-                    "window_start": start,
-                    "window_size": W,
-                    "total_frames": T_total,
-                },
+                "meta": meta,
             }
 
     def __iter__(self):

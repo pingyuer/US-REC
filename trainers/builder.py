@@ -210,10 +210,44 @@ def _build_scan_window_loaders(
     window_size = int(ds_cfg.get("sequence_window", 128))
     windows_per_scan = int(ds_cfg.get("windows_per_scan", 1))
     seed = int(OmegaConf.select(cfg, "seed") or 0)
+    augment_flip = bool(ds_cfg.get("augment_flip", False))
+    flip_prob = float(ds_cfg.get("flip_prob", 0.5))
+    # augment.reverse_prob (preferred key) overrides the legacy augment_flip/flip_prob pair.
+    # Example config:  dataset: { augment: { reverse_prob: 0.5 } }
+    _reverse_prob = OmegaConf.select(cfg, "dataset.augment.reverse_prob")
+    if _reverse_prob is not None:
+        augment_flip = True
+        flip_prob = float(_reverse_prob)
 
     dl_cfg = OmegaConf.select(cfg, "dataloader") or {}
     train_dl_cfg = OmegaConf.to_container(dl_cfg.get("train") or {}, resolve=True) if dl_cfg else {}
     val_dl_cfg = OmegaConf.to_container(dl_cfg.get("val") or {}, resolve=True) if dl_cfg else {}
+
+    # ── Optional calibration ────────────────────────────────────────────────
+    # Load tform_calib so the dataset can expose it per-sample for DDF loss /
+    # official TUS-REC metric computation in the trainer's evaluate().
+    tform_calib = None
+    image_size: tuple[int, int] | None = None
+    calib_file = ds_cfg.get("calib_file") or OmegaConf.select(cfg, "dataset.calib_file")
+    if calib_file:
+        try:
+            from trainers.utils.calibration import load_calibration  # noqa: PLC0415
+            resample_factor = float(ds_cfg.get("resample_factor", 1.0))
+            _, _, tform_calib = load_calibration(calib_file, resample_factor, device="cpu")
+            # tform_calib is returned as a torch.Tensor (4,4) or numpy; ensure tensor
+            if not isinstance(tform_calib, torch.Tensor):
+                import numpy as np  # noqa: PLC0415
+                tform_calib = torch.as_tensor(np.array(tform_calib), dtype=torch.float32)
+            tform_calib = tform_calib.float()
+        except Exception as exc:
+            import warnings
+            warnings.warn(f"[builder] Could not load calibration from {calib_file!r}: {exc}")
+            tform_calib = None
+    # Image size from config (H, W)
+    cfg_img_h = OmegaConf.select(cfg, "dataset.image_size_h") or OmegaConf.select(cfg, "model.image_size_h")
+    cfg_img_w = OmegaConf.select(cfg, "dataset.image_size_w") or OmegaConf.select(cfg, "model.image_size_w")
+    if cfg_img_h and cfg_img_w:
+        image_size = (int(cfg_img_h), int(cfg_img_w))
 
     train_loader = val_loader = None
     if dset_train is not None:
@@ -223,6 +257,10 @@ def _build_scan_window_loaders(
             windows_per_scan=windows_per_scan,
             mode="train",
             seed=seed,
+            augment_flip=augment_flip,
+            flip_prob=flip_prob,
+            calib_matrix=tform_calib,
+            image_size=image_size,
         )
         train_loader = DataLoader(
             sw_train,
@@ -237,6 +275,8 @@ def _build_scan_window_loaders(
             windows_per_scan=1,
             mode="val",
             seed=seed,
+            calib_matrix=tform_calib,
+            image_size=image_size,
         )
         val_loader = DataLoader(
             sw_val,

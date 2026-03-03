@@ -53,8 +53,8 @@ model:
 
   # Early-CNN encoder parameters
   encoder:
-    backbone: efficientnet_b0
-    pretrained: false
+    backbone: efficientnet_b1     # b1 has more capacity, matches paper
+    pretrained: true              # use ImageNet init; 1-ch avg handled in FrameEncoder
 
   # Temporal Transformer parameters
   transformer:
@@ -64,6 +64,13 @@ model:
     dim_feedforward: 1024
     window_size: 64
     dropout: 0.1
+    # Transformer-XL memory tokens: carry context across segment boundaries.
+    # 0 = disabled (same as original).  Set to 32 or 64 for cross-segment context.
+    memory_size: 0
+
+  # Image dimensions for DDF pixel sampling (H x W)
+  image_size_h: 480
+  image_size_w: 640
 
 # ---------------------------------------------------------------------------
 # Dataset (S3-backed)
@@ -120,7 +127,15 @@ dataset:
   # Scan-window mode (for longseq trainer)
   sequence_mode: scan_window
   sequence_window: 128
-  windows_per_scan: 1
+  windows_per_scan: 4           # was 1; more windows → better coverage per epoch
+
+  # Time-reversal augmentation for scan-window training
+  # augment.reverse_prob is the preferred key; legacy augment_flip/flip_prob
+  # are kept as fallbacks for backward compatibility.
+  augment_flip: true            # kept for backward compat
+  flip_prob: 0.5
+  augment:
+    reverse_prob: 0.5           # preferred key; overrides flip_prob when set
 
 dataloader:
   train:
@@ -170,6 +185,18 @@ loss:
   aux_intervals: [2, 4, 8, 16]
   aux_weight: 0.5            # base weight for auxiliary losses
   aux_decay: 0.5             # multiplicative decay per interval rank
+  aux_scale: none            # "none" (recommended for points mode) | "delta" | "delta2"
+
+  # Points-based loss mode: rotation error is encoded in point displacement,
+  # so no separate rot/trans weighting is needed.
+  mode: points               # "points" (default) | "se3" (ablation)
+  ref_pts_scale_mm: 20.0     # half-span of reference square in mm
+
+  # DDF surrogate loss: sample random pixels, map through calib, apply global T.
+  # Matches the TUS-REC evaluation oracle.  Requires dataset.calib_file.
+  # Set ddf_sample_weight: 0.0 to disable (no calib needed).
+  ddf_sample_weight: 0.0     # e.g. 0.1 once calib is confirmed correct
+  ddf_num_points: 1024       # random pixels per batch
 
   # Consistency constraint
   consistency_weight: 0.1
@@ -180,12 +207,13 @@ loss:
 # ---------------------------------------------------------------------------
 trainer:
   name: trainers.longseq_trainer.LongSeqTrainer
-  max_epochs: 50
+  max_epochs: 3
   log_interval: 50
   validate_every: 1
   save_interval: 100
   info_interval: 1
   retain_epoch: "00000000"
+  grad_accum: 4              # effective batch = batch_size × grad_accum = 4
   mode:
     inter: nointer
     meta: nonmeta
@@ -213,6 +241,11 @@ data:
 
 eval:
   max_scans: null
+  # Metric mode for evaluate():
+  #   "points"     — fast ref-point L2 proxy, no calib needed
+  #   "tusrec_ddf" — official TUS-REC DDF (GPE_mm/LPE_mm/final_score)
+  #                  requires dataset.calib_file to be set
+  metric_mode: tusrec_ddf
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -230,7 +263,7 @@ logging:
     artifact_subdir: artifacts
     register_model: false
     log_model_format: state_dict
-    best_metric: final_score
+    best_metric: val_tusrec_final_score
     best_mode: max
 
 runtime:

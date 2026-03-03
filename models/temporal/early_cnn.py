@@ -54,10 +54,10 @@ class FrameEncoder(nn.Module):
         else:
             raise ValueError(f"Unsupported backbone: {backbone}")
 
-        # Patch first conv for single-channel input
+        # Patch first conv for single-channel input, preserving pretrained weights
         first_conv = net.features[0][0]
         if first_conv.in_channels != in_channels:
-            net.features[0][0] = nn.Conv2d(
+            new_conv = nn.Conv2d(
                 in_channels,
                 first_conv.out_channels,
                 kernel_size=first_conv.kernel_size,
@@ -65,6 +65,17 @@ class FrameEncoder(nn.Module):
                 padding=first_conv.padding,
                 bias=first_conv.bias is not None,
             )
+            if pretrained:
+                # Average RGB channels so ImageNet statistics are retained:
+                # W_1ch = mean(W_rgb, dim=1, keepdim=True)
+                # This is strictly better than random init (near-identity start).
+                with torch.no_grad():
+                    new_conv.weight.data = first_conv.weight.data.mean(
+                        dim=1, keepdim=True
+                    )
+                    if first_conv.bias is not None and new_conv.bias is not None:
+                        new_conv.bias.data.copy_(first_conv.bias.data)
+            net.features[0][0] = new_conv
 
         self.features = net.features       # conv backbone
         self.avgpool = net.avgpool          # adaptive avgpool

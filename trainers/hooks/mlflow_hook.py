@@ -133,10 +133,24 @@ class MLflowHook(Hook):
         mlflow_cfg = OmegaConf.to_container(mlflow_cfg, resolve=True) if mlflow_cfg else {}
         metric_name = str(mlflow_cfg.get("best_metric") or "")
         if not metric_name:
-            metric_name = "final_score" if "final_score" in log_buffer else "val_loss"
+            if "val_tusrec_final_score" in log_buffer:
+                metric_name = "val_tusrec_final_score"
+            elif "final_score" in log_buffer:
+                metric_name = "final_score"
+            else:
+                metric_name = "val_loss"
         mode = str(mlflow_cfg.get("best_mode") or "")
         if not mode:
-            mode = "max" if metric_name in {"final_score"} else "min"
+            _max_mode_metrics = {
+                "final_score",
+                "val_tusrec_final_score",
+                "tusrec_final_score",
+                "GPE_score",
+                "LPE_score",
+                "GLE_score",
+                "LLE_score",
+            }
+            mode = "max" if metric_name in _max_mode_metrics else "min"
         return metric_name, mode
 
     def before_run(self, trainer, mode: str = "train"):
