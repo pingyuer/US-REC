@@ -516,10 +516,13 @@ class RecEvaluator:
             row = {"scan_id": sid}
             row.update({k: v for k, v in tusrec.items() if v is not None})
             if state["runtime_forward"]:
-                row["runtime_s_per_scan"] = float(sum(state["runtime_forward"]) / len(state["runtime_forward"]))
-                row["runtime_forward_s_per_scan"] = row["runtime_s_per_scan"]
+                row["runtime_forward_s_per_scan"] = float(sum(state["runtime_forward"]) / len(state["runtime_forward"]))
             if state["runtime_e2e"]:
                 row["runtime_e2e_s_per_scan"] = float(sum(state["runtime_e2e"]) / len(state["runtime_e2e"]))
+                row["runtime_s_per_scan"] = row["runtime_e2e_s_per_scan"]
+            elif state["runtime_forward"]:
+                # fall back to forward time if e2e timing was not recorded
+                row["runtime_s_per_scan"] = row["runtime_forward_s_per_scan"]
             row["num_pairs"] = int(min(len(locals_gt), len(locals_pred)))
             tusrec_rows.append(row)
             for key, value in row.items():

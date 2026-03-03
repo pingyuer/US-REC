@@ -153,7 +153,12 @@ def main(argv=None) -> int:
     # --dry-run: verify build + 1 batch, then exit
     if args.dry_run:
         print("[dry-run] Components built successfully.")
-        loader = trainer.val_loader_rec
+        loader = getattr(trainer, "val_loader", None)
+        if loader is None:
+            loader = getattr(trainer, "val_loader_rec", None)
+        if loader is None:
+            print("[dry-run] No val loader available. Exiting.")
+            return 0
         batch = next(iter(loader))
         if isinstance(batch, dict):
             for k, v in batch.items():
@@ -182,9 +187,12 @@ def main(argv=None) -> int:
         eval_callbacks = [h for h in eval_hooks if hasattr(h, "on_end")]
 
         evaluator = RecEvaluator(device=device)
+        eval_loader = getattr(trainer, "val_loader", None)
+        if eval_loader is None:
+            eval_loader = getattr(trainer, "val_loader_rec", None)
         metrics = evaluator.run(
             model=trainer.model,
-            loader=trainer.val_loader_rec,
+            loader=eval_loader,
             cfg=cfg,
             trainer=trainer,
             mode="test",
@@ -207,7 +215,6 @@ def main(argv=None) -> int:
     hooks = build_hooks(cfg, ctx, trainer=trainer)
     for h in hooks:
         trainer.register_hook(h)
-    trainer.multi_model()
 
     # Load checkpoint when resuming (retain_epoch > 0) or --checkpoint given
     ckpt_cfg = OmegaConf.select(cfg, "checkpoint") or {}
@@ -219,7 +226,12 @@ def main(argv=None) -> int:
     ):
         load_checkpoint(trainer.model, cfg, device, ctx=ctx)
 
-    trainer.train_rec_model()
+    # Dispatch: LongSeqTrainer uses .train(); baseline uses .multi_model() + .train_rec_model()
+    if hasattr(trainer, "multi_model"):
+        trainer.multi_model()
+        trainer.train_rec_model()
+    else:
+        trainer.train()
     return 0
 
 

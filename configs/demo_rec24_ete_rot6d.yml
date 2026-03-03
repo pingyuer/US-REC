@@ -1,4 +1,4 @@
-# Demo config for tus-rec-24 S3 freehand reconstruction (ETE).
+# Demo config for tus-rec-24 S3 freehand reconstruction (ETE) — rot6d (Zhou 2019).
 
 # ---------------------------------------------------------------------------
 # Reproducibility
@@ -35,7 +35,7 @@ model:
   #   "quat"       — 7-dim quaternion [w,x,y,z] + translation
   #   "rot6d"      — 9-dim 6D continuous (Zhou 2019) + translation
   pose_head:
-    rotation_rep: se3_expmap
+    rotation_rep: rot6d
 
 dataset:
   name: data.datasets.TUS_rec_s3.TUSRecS3Iterable
@@ -134,7 +134,7 @@ loss:
 
 trainer:
   name: trainers.rec_trainer.Train_Rec_Reg_Model
-  max_epochs: 100
+  max_epochs: 
   log_interval: 500
   validate_every: 1
   save_interval: 100

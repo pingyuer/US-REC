@@ -197,6 +197,56 @@ def resolve_run_dirs(cfg: Any, ctx: TrainingContext) -> dict[str, Path]:
     }
 
 
+def _build_scan_window_loaders(
+    cfg: Any,
+    dset_train: Any,
+    dset_val: Any,
+) -> tuple[Any, Any]:
+    """Wrap raw TUS-REC datasets into ScanWindowDataset → DataLoader for longseq."""
+    from data.datasets.scan_window import ScanWindowDataset  # noqa: PLC0415
+    from torch.utils.data import DataLoader
+
+    ds_cfg = OmegaConf.select(cfg, "dataset") or {}
+    window_size = int(ds_cfg.get("sequence_window", 128))
+    windows_per_scan = int(ds_cfg.get("windows_per_scan", 1))
+    seed = int(OmegaConf.select(cfg, "seed") or 0)
+
+    dl_cfg = OmegaConf.select(cfg, "dataloader") or {}
+    train_dl_cfg = OmegaConf.to_container(dl_cfg.get("train") or {}, resolve=True) if dl_cfg else {}
+    val_dl_cfg = OmegaConf.to_container(dl_cfg.get("val") or {}, resolve=True) if dl_cfg else {}
+
+    train_loader = val_loader = None
+    if dset_train is not None:
+        sw_train = ScanWindowDataset(
+            base_dataset=dset_train,
+            window_size=window_size,
+            windows_per_scan=windows_per_scan,
+            mode="train",
+            seed=seed,
+        )
+        train_loader = DataLoader(
+            sw_train,
+            batch_size=int(train_dl_cfg.get("batch_size", 1)),
+            num_workers=int(train_dl_cfg.get("num_workers", 0)),
+            pin_memory=bool(train_dl_cfg.get("pin_memory", False)),
+        )
+    if dset_val is not None:
+        sw_val = ScanWindowDataset(
+            base_dataset=dset_val,
+            window_size=window_size,
+            windows_per_scan=1,
+            mode="val",
+            seed=seed,
+        )
+        val_loader = DataLoader(
+            sw_val,
+            batch_size=int(val_dl_cfg.get("batch_size", 1)),
+            num_workers=int(val_dl_cfg.get("num_workers", 0)),
+            pin_memory=bool(val_dl_cfg.get("pin_memory", False)),
+        )
+    return train_loader, val_loader
+
+
 def build_rec_trainer(
     cfg: Any,
     save_path: str,
@@ -216,25 +266,37 @@ def build_rec_trainer(
     )
     TrainerCls = _resolve_class(trainer_name)
 
-    params = {
-        "cfg": cfg,
-        "save_path": save_path,
-        "non_improve_maxmum": trainer_cfg.pop("non_improve_maxmum", 1e10),
-        "reg_loss_weight": trainer_cfg.pop("reg_loss_weight", 1000),
-        "val_loss_min": trainer_cfg.pop("val_loss_min", 1e10),
-        "val_dist_min": trainer_cfg.pop("val_dist_min", 1e10),
-        "val_loss_min_reg": trainer_cfg.pop("val_loss_min_reg", 1e10),
-        "dset_train": dset_train,
-        "dset_val": dset_val,
-        "dset_train_reg": trainer_cfg.pop("dset_train_reg", None),
-        "dset_val_reg": trainer_cfg.pop("dset_val_reg", None),
-        "device": device,
-        "writer": writer,
-        "option": trainer_cfg.pop("option", "common_volume"),
-    }
+    # Detect longseq trainer: it expects train_loader/val_loader, not raw datasets.
+    sig = inspect.signature(TrainerCls.__init__)
+    uses_loaders = "train_loader" in sig.parameters
 
-    signature = inspect.signature(TrainerCls.__init__)
-    allowed = {k for k in signature.parameters if k != "self"}
+    if uses_loaders:
+        train_loader, val_loader = _build_scan_window_loaders(cfg, dset_train, dset_val)
+        params = {
+            "cfg": cfg,
+            "device": device,
+            "train_loader": train_loader,
+            "val_loader": val_loader,
+        }
+    else:
+        params = {
+            "cfg": cfg,
+            "save_path": save_path,
+            "non_improve_maxmum": trainer_cfg.pop("non_improve_maxmum", 1e10),
+            "reg_loss_weight": trainer_cfg.pop("reg_loss_weight", 1000),
+            "val_loss_min": trainer_cfg.pop("val_loss_min", 1e10),
+            "val_dist_min": trainer_cfg.pop("val_dist_min", 1e10),
+            "val_loss_min_reg": trainer_cfg.pop("val_loss_min_reg", 1e10),
+            "dset_train": dset_train,
+            "dset_val": dset_val,
+            "dset_train_reg": trainer_cfg.pop("dset_train_reg", None),
+            "dset_val_reg": trainer_cfg.pop("dset_val_reg", None),
+            "device": device,
+            "writer": writer,
+            "option": trainer_cfg.pop("option", "common_volume"),
+        }
+
+    allowed = {k for k in sig.parameters if k != "self"}
     final_params = {k: v for k, v in {**params, **trainer_cfg}.items() if k in allowed}
     return TrainerCls(**final_params)
 

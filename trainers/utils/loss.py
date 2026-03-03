@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from utils.utils_ori import compute_plane_normal, angle_between_planes
+from utils.geometry import compute_plane_normal, angle_between_planes
 
 
 def compute_loss(
@@ -57,6 +57,7 @@ def compute_loss(
         loss2 = torch.tensor(0.0, device=device)
     elif loss_type in {"reg", "rec_reg", "wraped"}:
         wrap_enabled = True
+        wrap_mseloss = torch.tensor(0.0, device=device)
         gt_volume, pred_volume, warped, ddf = scatter_pts_registration(labels, pred_pts, frames, step)
         if ddf_dirc == "Move" and conv_coords == "optimised_coord":
             wrap_mseloss, wrap_dist, _ = wrapped_pred_dist_fn(
@@ -80,6 +81,9 @@ def compute_loss(
             loss = loss1 + reg_loss_weight * loss2
         elif loss_type == "wraped" and ddf_dirc == "Move":
             loss = wrap_mseloss + regularization(ddf)
+        else:
+            # wraped + Fix (or any unhandled ddf_dirc): fall back to image-similarity loss
+            loss = loss2
     elif loss_type == "rec_volume":
         gt_volume, pred_volume = scatter_pts_interpolation(labels, pred_pts, frames, step)
         loss2 = criterion(pred_volume, gt_volume)

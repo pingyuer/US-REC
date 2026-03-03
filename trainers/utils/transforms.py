@@ -13,6 +13,7 @@ def build_transforms(
     image_points,
     tform_calib,
     tform_calib_R_T,
+    rotation_rep="se3_expmap",
 ):
     """Return (label_transform, prediction_transform)."""
     label_transform = LabelTransform(
@@ -31,5 +32,6 @@ def build_transforms(
         in_image_coords=True,
         tform_image_to_tool=tform_calib,
         tform_image_mm_to_tool=tform_calib_R_T,
+        rotation_rep=rotation_rep,
     )
     return label_transform, prediction_transform

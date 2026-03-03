@@ -2,7 +2,7 @@
 Reconstruction/registration trainer.
 
 Moved out of utils/utils_ete.py to match the refactored trainer layout.
-Helper ops now live in utils/rec_ops.py.
+Helper ops live in trainers/utils/rec_ops.py; model factory in models/pairwise.py.
 """
 
 import os
@@ -13,20 +13,27 @@ from torch.nn import MSELoss
 from torch.utils.data import IterableDataset
 from omegaconf import OmegaConf
 
-from utils.network import build_model
+from models.pairwise import build_model
 from trainers.hooks.base_hook import Hook
-from utils.utils_ori import (
+from utils.geometry import (
     reference_image_points,
     add_scalars_rec_volume,
     add_scalars_reg,
-    save_best_network,
-    save_best_network_reg,
     add_scalars_wrap_dist,
 )
-from utils.utils_grid_data import *
-from utils.monai.networks.nets import VoxelMorph
-from utils.monai.losses import BendingEnergyLoss
+from utils.interpolation import *
 from utils.funcs import *
+
+# Stubs for removed VoxelMorph / monai (non-rigid path is disabled).
+class _VoxelMorphStub:
+    pass
+
+class _BendingEnergyStub(torch.nn.Module):
+    def forward(self, x):
+        return torch.tensor(0.0, device=x.device)
+
+VoxelMorph = _VoxelMorphStub
+BendingEnergyLoss = _BendingEnergyStub
 
 from trainers.utils.config import parse_rec_cfg
 from trainers.utils.data import init_datasets, build_dataloaders
@@ -42,7 +49,7 @@ from trainers.utils.loss import compute_loss
 from trainers.utils.interp_reg import scatter_pts_interpolation, scatter_pts_registration
 from trainers.utils.model_io import save_rec_model, save_reg_model, load_model, save_best_models
 from trainers.utils.bn_utils import switch_off_batch_norm
-from utils.rec_ops import compute_dimention, data_pairs_adjacent, ConvPose
+from trainers.utils.rec_ops import compute_dimention, data_pairs_adjacent, ConvPose
 from trainers.rec_evaluator import RecEvaluator
 from trainers.metrics import (
     end_to_start_rpe_rotation_deg,
@@ -504,6 +511,9 @@ class Train_Rec_Reg_Model:
                         epoch=epoch + 1,
                         ctx=self.ctx,
                     )
+                    # Store for VizHook.after_val (needs scan_globals etc.)
+                    self.last_eval_metrics = metrics
+
                     epoch_loss_val = float(metrics.get("val_loss", 0.0))
                     epoch_loss_val_rec = float(metrics.get("val_loss_rec", 0.0))
                     epoch_loss_val_reg = float(metrics.get("val_loss_reg", 0.0))

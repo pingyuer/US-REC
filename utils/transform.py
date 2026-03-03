@@ -2,6 +2,13 @@
 import torch
 # import pytorch3d.transforms
 from utils.rigid_transform_3D import rigid_transform_3D
+from utils.rotation import (
+    normalize_quat,
+    quat_to_rotmat,
+    rot6d_to_rotmat,
+    make_se3,
+    ROTATION_REP_DIM,
+)
 
 ''' Geometric transformation used in transforms:
 Use left-multiplication:
@@ -124,7 +131,8 @@ class PredictionTransform():
         image_points=None,
         in_image_coords=None,
         tform_image_to_tool=None,
-        tform_image_mm_to_tool=None
+        tform_image_mm_to_tool=None,
+        rotation_rep="se3_expmap",
         ):
         
         """
@@ -137,6 +145,7 @@ class PredictionTransform():
         self.pred_type = pred_type
         self.label_type = label_type
         self.num_pairs = num_pairs
+        self.rotation_rep = rotation_rep
 
         self.image_points = image_points
         self.tform_image_to_tool = tform_image_to_tool
@@ -166,7 +175,8 @@ class PredictionTransform():
                 elif self.label_type=="parameter":
                     self.call_function = self.parameter_to_parameter
                 elif self.label_type == "transform":
-                    self.call_function = self.param_to_transform
+                    # Route through rotation-rep-aware converter
+                    self.call_function = self._param_to_transform_dispatch
                 else:
                     raise('Unknown label_type!')
 
@@ -328,6 +338,40 @@ class PredictionTransform():
         return points
 
 
+    # ─── rotation_rep-aware dispatchers ────────────────────────────────
+
+    def _param_to_transform_dispatch(self, params):
+        """Route to the correct param→transform based on self.rotation_rep."""
+        if self.rotation_rep == "se3_expmap":
+            return self.param_to_transform(params)
+        elif self.rotation_rep == "quat":
+            return self._quat_param_to_transform(params)
+        elif self.rotation_rep == "rot6d":
+            return self._rot6d_param_to_transform(params)
+        else:
+            raise ValueError(f"Unknown rotation_rep: {self.rotation_rep}")
+
+    def _quat_param_to_transform(self, params):
+        """Convert (B, num_pairs, 7) → (B, num_pairs, 4, 4).
+
+        params[..., :4] = quaternion [w, x, y, z]
+        params[..., 4:7] = translation [tx, ty, tz]
+        """
+        q = params[..., :4]    # (B, num_pairs, 4)
+        t = params[..., 4:7]   # (B, num_pairs, 3)
+        R = quat_to_rotmat(normalize_quat(q))  # (B, num_pairs, 3, 3)
+        return make_se3(R, t)
+
+    def _rot6d_param_to_transform(self, params):
+        """Convert (B, num_pairs, 9) → (B, num_pairs, 4, 4).
+
+        params[..., :6] = rot6d [a1,a2,a3,b1,b2,b3]
+        params[..., 6:9] = translation [tx, ty, tz]
+        """
+        r6d = params[..., :6]  # (B, num_pairs, 6)
+        t = params[..., 6:9]   # (B, num_pairs, 3)
+        R = rot6d_to_rotmat(r6d)  # (B, num_pairs, 3, 3)
+        return make_se3(R, t)
 
 
     @staticmethod

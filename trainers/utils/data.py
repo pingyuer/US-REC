@@ -7,7 +7,7 @@ from typing import Tuple
 import torch
 from torch.utils.data import IterableDataset
 
-from utils.rec_ops import data_pairs_adjacent
+from trainers.utils.rec_ops import data_pairs_adjacent
 
 
 def init_datasets(dset_train, dset_val, num_samples: int) -> Tuple[int, torch.Tensor]:

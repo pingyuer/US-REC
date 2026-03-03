@@ -61,7 +61,9 @@ class LoggerHook(Hook):
         loss = log_buffer.get("loss", None)
         lr = log_buffer.get("lr", None)
         epoch = log_buffer.get("epoch", None)
-        msg = f"[train] epoch={epoch} step={step} loss={loss:.6f} lr={lr:.6g}"
+        loss_str = f"{loss:.6f}" if loss is not None else "n/a"
+        lr_str = f"{lr:.6g}" if lr is not None else "n/a"
+        msg = f"[train] epoch={epoch} step={step} loss={loss_str} lr={lr_str}"
         self._writeln(msg)
 
     def after_epoch(self, trainer, log_buffer=None):
@@ -70,7 +72,9 @@ class LoggerHook(Hook):
         epoch = int(log_buffer.get("epoch", trainer.epoch + 1))
         train_loss = log_buffer.get("train_loss", None)
         lr = log_buffer.get("lr", None)
-        msg = f"[epoch] epoch={epoch} train_loss={train_loss:.6f} lr={lr:.6g}"
+        loss_str = f"{train_loss:.6f}" if train_loss is not None else "n/a"
+        lr_str = f"{lr:.6g}" if lr is not None else "n/a"
+        msg = f"[epoch] epoch={epoch} train_loss={loss_str} lr={lr_str}"
         self._writeln(msg)
 
     def after_val(self, trainer, log_buffer=None):
@@ -82,7 +86,7 @@ class LoggerHook(Hook):
         best_val_loss = log_buffer.get("best_val_loss", None)
         best_epoch = log_buffer.get("best_epoch", None)
 
-        msg = f"[val] epoch={epoch} val_loss={val_loss:.6f}"
+        msg = f"[val] epoch={epoch} val_loss={val_loss:.6f}" if val_loss is not None else f"[val] epoch={epoch}"
         if is_best:
             msg += f" (best val_loss={best_val_loss:.6f} @ epoch={best_epoch})"
         self._writeln(msg)

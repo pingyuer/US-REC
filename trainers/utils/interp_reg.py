@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from utils.funcs import compute_common_volume
-from utils.utils_grid_data import interpolation_3D_pytorch_batched
+from utils.interpolation import interpolation_3D_pytorch_batched
 
 
 def scatter_pts_interpolation(

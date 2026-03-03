@@ -1,7 +1,6 @@
-"""Trainers module for model training."""
+"""Trainers module — reconstruction / pose estimation."""
 
 from .builder import build_optimizer
 from .context import TrainingContext
-from .trainer import Trainer
 
-__all__ = ["Trainer", "TrainingContext", "build_optimizer"]
+__all__ = ["TrainingContext", "build_optimizer"]

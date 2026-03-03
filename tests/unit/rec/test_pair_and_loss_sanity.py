@@ -4,8 +4,8 @@ pytestmark = pytest.mark.unit
 import torch
 
 from trainers.utils.loss import compute_loss
-from utils.rec_ops import data_pairs_adjacent
-from utils.utils_ori import reference_image_points
+from trainers.utils.rec_ops import data_pairs_adjacent
+from utils.geometry import reference_image_points
 
 
 def test_data_pairs_adjacent_chain():

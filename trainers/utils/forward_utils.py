@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from utils.rec_ops import ConvPose
+from trainers.utils.rec_ops import ConvPose
 
 
 def unpack_batch(batch):

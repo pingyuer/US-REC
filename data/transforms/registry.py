@@ -15,9 +15,7 @@ def _ensure_builtin_imports() -> None:
     # Best-effort imports so built-in transforms register themselves.
     for mod in (
         "data.transforms.finalize_ops",
-        "data.transforms.tui_ops",
         "data.transforms.custom_transforms",
-        "data.transforms.custon_transforms",  # legacy shim
     ):
         try:
             importlib.import_module(mod)

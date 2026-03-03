@@ -62,6 +62,14 @@ def parse_rec_cfg(cfg: Any) -> Dict[str, Any]:
     out["alpha_def"] = float(get_cfg_value(cfg, "loss.alpha_def", 0.0))
     out["alpha_voxel"] = float(get_cfg_value(cfg, "loss.alpha_voxel", 0.0))
 
+    # Rotation parameterization
+    out["rotation_rep"] = str(get_cfg_value(cfg, "model.pose_head.rotation_rep", "se3_expmap"))
+    # Rotation-aware loss settings
+    out["rot_loss_type"] = str(get_cfg_value(cfg, "loss.rot_loss", "geodesic"))
+    out["trans_loss_type"] = str(get_cfg_value(cfg, "loss.trans_loss", "l2"))
+    out["rot_weight"] = float(get_cfg_value(cfg, "loss.rot_weight", 1.0))
+    out["trans_weight"] = float(get_cfg_value(cfg, "loss.trans_weight", 1.0))
+
     out["inter"] = get_cfg_value(cfg, "trainer.mode.inter")
     out["meta"] = get_cfg_value(cfg, "trainer.mode.meta")
     out["retain_epoch"] = get_cfg_value(cfg, "trainer.retain_epoch", 0)

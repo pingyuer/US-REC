@@ -18,7 +18,6 @@ from .tusrec import compute_tusrec_metrics
 from .volume import volume_ssim, volume_ncc, volume_dice
 from .functional import iou_score
 from .edge import edge_f1score
-from .segmentation import ConfusionMatrix
 
 # Authoritative compose helpers — single source: metrics.compose
 from metrics.compose import compose_global_from_local, local_from_global  # noqa: F401
@@ -45,7 +44,6 @@ __all__ = [
     "volume_ssim",
     "volume_ncc",
     "volume_dice",
-    "ConfusionMatrix",
     "edge_f1score",
     "iou_score",
 ]

@@ -36,12 +36,10 @@ def create_dummy_config():
     """创建测试配置"""
     cfg = OmegaConf.create({
         "model": {
-            "name": "test_unet",
-            "num_classes": 2,
+            "name": "test_rec",
         },
         "dataset": {
-            "name": "data.datasets.seg_dataset.DummyDataset",
-            "img_dir": {"train": "/tmp/train", "val": "/tmp/val"},
+            "name": "dummy",
         },
         "optimizer": {
             "type": "adamw",

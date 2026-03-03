@@ -1,1 +1,5 @@
-"""eval — unified evaluation & export entry-point for TUS-REC."""
+"""eval — evaluation export utilities for TUS-REC.
+
+entry-point: main_rec.py --eval-only
+export:       eval.export.export_results
+"""

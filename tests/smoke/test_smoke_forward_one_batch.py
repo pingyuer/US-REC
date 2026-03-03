@@ -16,9 +16,9 @@ CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs" / "demo_rec24_ete.
 
 def _build_minimal_model(cfg):
     """Build the model used in rec training with minimal frame count."""
-    from utils.network import build_model
-    from utils.rec_ops import compute_dimention, data_pairs_adjacent
-    from utils.utils_ori import reference_image_points
+    from models.pairwise import build_model
+    from trainers.utils.rec_ops import compute_dimention, data_pairs_adjacent
+    from utils.geometry import reference_image_points
     from trainers.utils.calibration import load_calibration
 
     num_samples = 2  # pair-based: 2 frames

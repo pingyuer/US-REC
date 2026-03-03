@@ -1,4 +1,17 @@
-# Demo config for tus-rec-24 S3 freehand reconstruction (ETE).
+# Long-sequence (Early-CNN + Temporal Transformer) config for TUS-REC-24.
+#
+# Two-stage architecture:
+#   1. Per-frame EfficientNet encoder  → frame tokens
+#   2. Causal sliding-window Transformer → context tokens
+#   3. LocalPoseHead (Δ=1) + MultiIntervalHead (Δ∈{2,4,8,16})
+#
+# Multi-interval auxiliary supervision + consistency constraint to
+# reduce global drift (GPE).
+#
+# Run modes (from project root):
+#   Train:      python main_rec.py --config configs/demo_rec24_ete_longseq.yml
+#   Smoke eval: python -m trainers.longseq_trainer  (see bottom of that file)
+#   Test:       pytest tests/test_longseq_smoke.py -v
 
 # ---------------------------------------------------------------------------
 # Reproducibility
@@ -6,7 +19,7 @@
 seed: 0
 
 # ---------------------------------------------------------------------------
-# Paths (all filesystem writes reference these — no hardcoded relative paths)
+# Paths
 # ---------------------------------------------------------------------------
 paths:
   output_dir: logs
@@ -14,8 +27,13 @@ paths:
   ckpt_dir: null
   cache_dir: null
 
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
 model:
-  name: efficientnet_b1
+  # Switch between baseline pairwise ("efficientnet_b1") and new longseq model.
+  type: longseq_transformer  # "longseq_transformer" | "baseline"
+  name: efficientnet_b1      # kept for baseline fallback
   pred_type: parameter
   label_type: transform
   in_ch_reg: 1
@@ -30,13 +48,26 @@ model:
   interpolation:
     method: bilinear
     volume: fixed_interval
-  # Pose head rotation parameterization:
-  #   "se3_expmap" — 6-dim Euler (ZYX) [default, legacy]
-  #   "quat"       — 7-dim quaternion [w,x,y,z] + translation
-  #   "rot6d"      — 9-dim 6D continuous (Zhou 2019) + translation
   pose_head:
-    rotation_rep: se3_expmap
+    rotation_rep: rot6d   # "rot6d" recommended for transformer head
 
+  # Early-CNN encoder parameters
+  encoder:
+    backbone: efficientnet_b0
+    pretrained: false
+
+  # Temporal Transformer parameters
+  transformer:
+    d_model: 256
+    n_heads: 4
+    n_layers: 4
+    dim_feedforward: 1024
+    window_size: 64
+    dropout: 0.1
+
+# ---------------------------------------------------------------------------
+# Dataset (S3-backed)
+# ---------------------------------------------------------------------------
 dataset:
   name: data.datasets.TUS_rec_s3.TUSRecS3Iterable
   backend: s3
@@ -61,7 +92,6 @@ dataset:
   sampling:
     pair_mode: adjacent
     random_pairs_per_slice: null
-    # Per-split settings: shuffle/buffer only in training; eval is deterministic.
     shuffle_slices:
       train: true
       val: false
@@ -78,8 +108,6 @@ dataset:
       train: 1.0
       val: 1.0
       test: 1.0
-    # Direction-flip augmentation: swap (A,B) → (B,A) with p=0.5 during training.
-    # Helps the model generalise motion estimation to both scan directions.
     augment_direction_flip:
       train: true
       val: false
@@ -89,9 +117,14 @@ dataset:
     num_samples: 100
     sample_range: 100
 
+  # Scan-window mode (for longseq trainer)
+  sequence_mode: scan_window
+  sequence_window: 128
+  windows_per_scan: 1
+
 dataloader:
   train:
-    batch_size: 12
+    batch_size: 1          # sequence mode: 1 scan-window per batch
     num_workers: 0
     shuffle: false
     drop_last: false
@@ -109,6 +142,9 @@ dataloader:
     drop_last: false
     pin_memory: false
 
+# ---------------------------------------------------------------------------
+# Optimizer
+# ---------------------------------------------------------------------------
 optimizer:
   type: adam
   lr_rec: 1e-4
@@ -117,25 +153,35 @@ optimizer:
 lr_scheduler:
   type: null
 
+# ---------------------------------------------------------------------------
+# Loss
+# ---------------------------------------------------------------------------
 loss:
-  type: MSE_points
+  type: MSE_points           # baseline path (used by pairwise trainer)
   reg_weight: 1000
   alpha_def: 0.0
   alpha_voxel: 0.0
-  # Rotation-aware loss (used only when rotation_rep != se3_expmap
-  # or when you want explicit geometric rotation supervision):
-  #   rot_loss: "geodesic" | "quat_inner"
-  #   trans_loss: "l1" | "l2"
-  #   rot_weight / trans_weight: scalar balancing terms
   rot_loss: geodesic
   trans_loss: l2
   rot_weight: 1.0
   trans_weight: 1.0
 
+  # Long-sequence multi-interval auxiliary supervision
+  aux_intervals: [2, 4, 8, 16]
+  aux_weight: 0.5            # base weight for auxiliary losses
+  aux_decay: 0.5             # multiplicative decay per interval rank
+
+  # Consistency constraint
+  consistency_weight: 0.1
+  consistency_delta: 2
+
+# ---------------------------------------------------------------------------
+# Trainer
+# ---------------------------------------------------------------------------
 trainer:
-  name: trainers.rec_trainer.Train_Rec_Reg_Model
-  max_epochs: 100
-  log_interval: 500
+  name: trainers.longseq_trainer.LongSeqTrainer
+  max_epochs: 50
+  log_interval: 50
   validate_every: 1
   save_interval: 100
   info_interval: 1
@@ -152,27 +198,34 @@ trainer:
     option: common_volume
 
 # ---------------------------------------------------------------------------
-# Sampling limits (set via CLI --max-scans / --max-frames for smoke tests)
+# Training
+# ---------------------------------------------------------------------------
+train:
+  max_steps: null
+  sequence_window: 128
+
+# ---------------------------------------------------------------------------
+# Evaluation
 # ---------------------------------------------------------------------------
 data:
   max_scans: null
   max_frames_per_scan: null
 
-train:
-  max_steps: null
-
 eval:
   max_scans: null
 
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 logging:
   mlflow:
     enabled: true
     tracking_uri: ${oc.env:MLFLOW_TRACKING_URI,"http://172.16.240.33:5000"}
     experiment_name: ${oc.env:MLFLOW_EXPERIMENT_NAME,"rec"}
-    run_name: ${oc.env:MLFLOW_RUN_NAME,"${now:%Y%m%d_%H%M%S}_${model.name}"}
+    run_name: ${oc.env:MLFLOW_RUN_NAME,"${now:%Y%m%d_%H%M%S}_longseq"}
     tags:
       dataset: tus_rec24
-      model: efficientnet_b1
+      model: longseq_transformer
     log_system_metrics: false
     artifact_subdir: artifacts
     register_model: false
@@ -185,34 +238,25 @@ runtime:
   multi_gpu: false
 
 # ---------------------------------------------------------------------------
-# Checkpoint loading (MLflow-first, local fallback)
+# Checkpoint
 # ---------------------------------------------------------------------------
 checkpoint:
-  # --- MLflow source ---
-  # Pin a specific MLflow run ID to load from.  null = auto-search best run.
   mlflow_run_id: null
-  # Artifact sub-path inside the run (MLflowHook saves here).
   mlflow_artifact: "checkpoints/best"
-  # When mlflow_run_id is null, search the experiment for the best finished run.
   mlflow_search_best: true
-
-  # --- Local fallback (used when MLflow is unreachable or disabled) ---
-  # Explicit .pt file path; null = auto-scan <run_dir>/checkpoints/best_*.pt
   local_path: null
-
-  # --- Behaviour ---
-  load_on_eval: true      # load before --eval-only
-  load_on_resume: true    # load when retain_epoch > 0 (training resume)
-  strict: true            # strict=True for load_state_dict
+  load_on_eval: true
+  load_on_resume: true
+  strict: true
 
 # ---------------------------------------------------------------------------
-# Visualisation (VizHook)
+# Visualisation
 # ---------------------------------------------------------------------------
 viz:
   enabled: true
-  drift_curve: true    # GPE/LPE per-frame drift curve (pred vs gt)
-  pose_curve: true     # translation norm & rotation angle vs frame
-  recon_slices: false  # axial/sagittal/coronal slices (only if volume available)
+  drift_curve: true
+  pose_curve: true
+  recon_slices: false
   save_png: true
   save_csv: true
-  out_dir: null        # null → <run_dir>/viz/
+  out_dir: null
