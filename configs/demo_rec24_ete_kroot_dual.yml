@@ -1,0 +1,284 @@
+# K-root DUAL config — joint training of Short + Long branches with stitch eval.
+#
+# Trains two independent LongSeqPoseModel instances simultaneously:
+# - Short branch: contiguous k-frame windows, Δ=1 local transforms
+# - Long branch:  sparse k-token windows at stride s, Δ=1 in sparse domain
+#
+# Evaluation runs the full stitch pipeline: long anchors provide global
+# skeleton, short provides dense refinement, fused via SE(3) endpoint interp.
+#
+# GPU memory budget (A30 24GB, measured):
+#   Static (2× model params + AdamW states + EMA):  ~340 MB
+#   Per-step peak (bs=1, k=64, 480×640):            ~11.8 GB
+#   Total peak:                                     ~12.1 GB / 24 GB
+#   batch_size=2 would OOM — use grad_accum=8 for effective batch=8.
+#
+# Run:
+#   python main_rec.py --config configs/demo_rec24_ete_kroot_dual.yml
+#   python main_rec.py --config configs/demo_rec24_ete_kroot_dual.yml --eval-only
+
+# ---------------------------------------------------------------------------
+# Reproducibility
+# ---------------------------------------------------------------------------
+seed: 0
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+paths:
+  output_dir: logs
+
+# ---------------------------------------------------------------------------
+# K-root params
+# ---------------------------------------------------------------------------
+kroot:
+  k: 64                     # token window length for both models
+  s: 8                      # sparse stride for long branch = int(round(sqrt(k)))
+
+# ---------------------------------------------------------------------------
+# Model — both branches are LongSeqPoseModel (no auxΔ, no memory)
+#
+# Per-branch overrides: model.short.transformer.* / model.long.transformer.*
+# Fallback to model.transformer.* for shared defaults.
+# ---------------------------------------------------------------------------
+model:
+  type: kroot_dual
+  name: efficientnet_b1
+  pred_type: parameter
+  label_type: transform
+  in_ch_reg: 1
+  ddf_dirc: Move
+  conv_coords: optimised_coord
+  img_pro_coord: pro_coord
+  batch_norm: BNoff
+  use_voxelmorph: false
+  use_deform: false
+  use_backward: false
+  enable_voxel: false
+  interpolation:
+    method: bilinear
+    volume: fixed_interval
+  pose_head:
+    rotation_rep: rot6d
+
+  encoder:
+    backbone: efficientnet_b1
+    pretrained: true
+
+  # Shared transformer defaults (per-branch overrides below)
+  transformer:
+    d_model: 256
+    n_heads: 4
+    n_layers: 4
+    dim_feedforward: 1024
+    window_size: 64
+    dropout: 0.1
+    seg_len: 0
+    memory_size: 0
+
+  # Per-branch overrides (optional — falls back to model.transformer.*)
+  short:
+    transformer:
+      n_layers: 4
+      window_size: 64
+
+  long:
+    transformer:
+      n_layers: 4
+      window_size: 64
+
+  image_size_h: 480
+  image_size_w: 640
+
+# ---------------------------------------------------------------------------
+# Dataset — dual loaders (ShortWindowDataset + LongWindowDataset)
+# ---------------------------------------------------------------------------
+dataset:
+  name: data.datasets.TUS_rec_s3.TUSRecS3Iterable
+  backend: s3
+  bucket: ${oc.env:TUS_REC24_BUCKET,tus-rec-24}
+  region: ${oc.env:TUS_REC24_REGION,us-east-1}
+  endpoint: ${oc.env:TUS_REC24_ENDPOINT,http://172.16.240.77:9000}
+  force_path_style: true
+  prefix:
+    train: train
+    val: val
+    test: val
+  frame_dir: frames
+  tform_dir:
+    train: null
+    val: transfs
+    test: transfs
+  landmark_dir: landmark
+  return_landmarks: false
+  max_keys: 2000
+  calib_file: ${oc.env:TUS_REC24_CALIB,s3://tus-rec-24/train/calib_matrix.csv}
+  resample_factor: 4
+  sampling:
+    pair_mode: adjacent
+    random_pairs_per_slice: null
+    shuffle_slices:
+      train: true
+      val: false
+      test: false
+    shuffle_pairs:
+      train: true
+      val: false
+      test: false
+    shuffle_buffer_size:
+      train: 4096
+      val: 0
+      test: 0
+    buffer_emit_prob:
+      train: 1.0
+      val: 1.0
+      test: 1.0
+    augment_direction_flip:
+      train: true
+      val: false
+      test: false
+    prefetch_slices: 4
+    seed: 0
+    num_samples: 100
+    sample_range: 100
+
+  # Dual-mode: triggers _build_kroot_dual_loaders in builder.py
+  sequence_mode: kroot_dual
+  sequence_window: 64          # = k
+
+  # Short branch
+  short_overlap: 8             # overlap between consecutive short windows
+
+  # Long branch
+  long_stride: 8               # = s
+  long_overlap_tokens: 0
+  long_window_stride: 32
+
+  # Augmentation
+  augment_flip: true
+  flip_prob: 0.5
+  augment:
+    reverse_prob: 0.5
+
+dataloader:
+  train:
+    batch_size: 1              # max for 24GB (bs=2 OOMs at ~23GB per model)
+    num_workers: 4             # overlap CPU data loading with GPU compute
+    shuffle: false
+    drop_last: false
+    pin_memory: true           # faster CPU→GPU transfer
+  val:
+    batch_size: 1
+    num_workers: 4
+    shuffle: false
+    drop_last: false
+    pin_memory: true
+  test:
+    batch_size: 1
+    num_workers: 4
+    shuffle: false
+    drop_last: false
+    pin_memory: true
+
+# ---------------------------------------------------------------------------
+# Optimizer — shared defaults for both branches
+# ---------------------------------------------------------------------------
+optimizer:
+  type: adamw
+  lr_rec: 5e-4
+  weight_decay: 1e-2
+  betas: [0.9, 0.999]
+  min_lr: 1e-6
+  warmup_steps: 200
+  encoder_lr_mult: 0.1        # encoder uses lr * 0.1
+
+# ---------------------------------------------------------------------------
+# Loss — chordal rotation + smooth L1 translation (no auxΔ, no consistency)
+# ---------------------------------------------------------------------------
+loss:
+  rot_weight: 1.0
+  trans_weight: 1.0
+  short_weight: 1.0           # weight for short branch total loss
+  long_weight: 1.0            # weight for long branch total loss
+
+# ---------------------------------------------------------------------------
+# Trainer
+# ---------------------------------------------------------------------------
+trainer:
+  name: trainers.kroot_dual_trainer.KRootDualTrainer
+  max_epochs: 3
+  log_interval: 50
+  validate_every: 1
+  grad_accum: 8               # effective batch = 8 (bs=1 × accum=8); compensates for bs=1 limit
+  max_grad_norm: 1.0
+  ema_decay: 0.999
+  rec_trainer:
+    non_improve_maxmum: 1e10
+    reg_loss_weight: 1000
+    val_loss_min: 1e10
+    val_dist_min: 1e10
+    val_loss_min_reg: 1e10
+    option: common_volume
+  mode:
+    inter: nointer
+    meta: nonmeta
+
+# ---------------------------------------------------------------------------
+# Stitch fusion config (used at eval time)
+# ---------------------------------------------------------------------------
+stitch:
+  enable_endpoint_interp: true     # two-endpoint SE(3) correction
+  interp_space: se3_log
+  short_overlap: 8                 # short model sliding window overlap for inference
+  long_window_stride: 32           # long model sliding window stride (tokens)
+
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
+data:
+  max_scans: null
+  max_frames_per_scan: null
+
+eval:
+  max_scans: null
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging:
+  mlflow:
+    enabled: true
+    tracking_uri: ${oc.env:MLFLOW_TRACKING_URI,"http://172.16.240.33:5000"}
+    experiment_name: ${oc.env:MLFLOW_EXPERIMENT_NAME,"rec"}
+    run_name: ${oc.env:MLFLOW_RUN_NAME,"${now:%Y%m%d_%H%M%S}_kroot_dual"}
+    tags:
+      dataset: tus_rec24
+      model: kroot_dual
+    log_system_metrics: false
+    artifact_subdir: artifacts
+    register_model: false
+    log_model_format: state_dict
+    best_metric: val_loss
+    best_mode: min
+
+runtime:
+  gpu_ids: "0"
+  multi_gpu: false
+
+checkpoint:
+  mlflow_run_id: null
+  mlflow_artifact: "checkpoints/best"
+  mlflow_search_best: true
+  local_path: null
+  load_on_eval: true
+  load_on_resume: true
+  strict: true
+
+viz:
+  enabled: true
+  drift_curve: true
+  pose_curve: true
+  recon_slices: false
+  save_png: true
+  save_csv: true
+  out_dir: null

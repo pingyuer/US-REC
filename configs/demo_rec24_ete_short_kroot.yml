@@ -1,0 +1,237 @@
+# K-root SHORT branch config for TUS-REC-24.
+#
+# ShortTransformer: contiguous windows of k frames, predicts Δ=1 local transforms.
+# Trained independently — no auxΔ, no consistency.
+#
+# Run:
+#   python main_rec.py --config configs/demo_rec24_ete_short_kroot.yml
+#   python main_rec.py --config configs/demo_rec24_ete_short_kroot.yml --eval-only
+
+# ---------------------------------------------------------------------------
+# Reproducibility
+# ---------------------------------------------------------------------------
+seed: 0
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+paths:
+  output_dir: logs
+
+# ---------------------------------------------------------------------------
+# K-root branch config
+# ---------------------------------------------------------------------------
+kroot:
+  branch: short            # "short" or "long"
+  k: 64                    # token window length (fixed)
+  s: 8                     # sparse stride (only used by long branch; kept for reference)
+
+# ---------------------------------------------------------------------------
+# Model: LongSeqPoseModel (no auxΔ, no memory)
+# ---------------------------------------------------------------------------
+model:
+  type: kroot
+  name: efficientnet_b1
+  pred_type: parameter
+  label_type: transform
+  in_ch_reg: 1
+  ddf_dirc: Move
+  conv_coords: optimised_coord
+  img_pro_coord: pro_coord
+  batch_norm: BNoff
+  use_voxelmorph: false
+  use_deform: false
+  use_backward: false
+  enable_voxel: false
+  interpolation:
+    method: bilinear
+    volume: fixed_interval
+  pose_head:
+    rotation_rep: rot6d
+
+  encoder:
+    backbone: efficientnet_b1
+    pretrained: true
+
+  transformer:
+    d_model: 256
+    n_heads: 4
+    n_layers: 4
+    dim_feedforward: 1024
+    window_size: 64
+    dropout: 0.1
+    seg_len: 0
+    memory_size: 0
+
+  image_size_h: 480
+  image_size_w: 640
+
+# ---------------------------------------------------------------------------
+# Dataset — ShortWindowDataset (contiguous, stride=1)
+# ---------------------------------------------------------------------------
+dataset:
+  name: data.datasets.TUS_rec_s3.TUSRecS3Iterable
+  backend: s3
+  bucket: ${oc.env:TUS_REC24_BUCKET,tus-rec-24}
+  region: ${oc.env:TUS_REC24_REGION,us-east-1}
+  endpoint: ${oc.env:TUS_REC24_ENDPOINT,http://172.16.240.77:9000}
+  force_path_style: true
+  prefix:
+    train: train
+    val: val
+    test: val
+  frame_dir: frames
+  tform_dir:
+    train: null
+    val: transfs
+    test: transfs
+  landmark_dir: landmark
+  return_landmarks: false
+  max_keys: 2000
+  calib_file: ${oc.env:TUS_REC24_CALIB,s3://tus-rec-24/train/calib_matrix.csv}
+  resample_factor: 4
+  sampling:
+    pair_mode: adjacent
+    random_pairs_per_slice: null
+    shuffle_slices:
+      train: true
+      val: false
+      test: false
+    shuffle_pairs:
+      train: true
+      val: false
+      test: false
+    shuffle_buffer_size:
+      train: 4096
+      val: 0
+      test: 0
+    buffer_emit_prob:
+      train: 1.0
+      val: 1.0
+      test: 1.0
+    augment_direction_flip:
+      train: true
+      val: false
+      test: false
+    prefetch_slices: 4
+    seed: 0
+    num_samples: 100
+    sample_range: 100
+
+  # ShortWindow specific
+  sequence_mode: kroot_short
+  sequence_window: 64          # = k
+  short_overlap: 8             # overlap between consecutive tiled windows
+
+  augment_flip: true
+  flip_prob: 0.5
+  augment:
+    reverse_prob: 0.5
+
+dataloader:
+  train:
+    batch_size: 1
+    num_workers: 0
+    shuffle: false
+    drop_last: false
+    pin_memory: false
+  val:
+    batch_size: 1
+    num_workers: 0
+    shuffle: false
+    drop_last: false
+    pin_memory: false
+  test:
+    batch_size: 1
+    num_workers: 0
+    shuffle: false
+    drop_last: false
+    pin_memory: false
+
+# ---------------------------------------------------------------------------
+# Optimizer
+# ---------------------------------------------------------------------------
+optimizer:
+  type: adamw
+  lr_rec: 5e-4
+  weight_decay: 1e-2
+  betas: [0.9, 0.999]
+
+# ---------------------------------------------------------------------------
+# Loss — chordal rotation + smooth L1 translation (no auxΔ, no consistency)
+# ---------------------------------------------------------------------------
+loss:
+  rot_weight: 1.0
+  trans_weight: 1.0
+
+# ---------------------------------------------------------------------------
+# Trainer
+# ---------------------------------------------------------------------------
+trainer:
+  name: trainers.kroot_trainer.KRootTrainer
+  max_epochs: 3
+  log_interval: 50
+  validate_every: 1
+  grad_accum: 4
+  max_grad_norm: 1.0
+  rec_trainer:
+    non_improve_maxmum: 1e10
+    reg_loss_weight: 1000
+    val_loss_min: 1e10
+    val_dist_min: 1e10
+    val_loss_min_reg: 1e10
+    option: common_volume
+  mode:
+    inter: nointer
+    meta: nonmeta
+
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
+data:
+  max_scans: null
+  max_frames_per_scan: null
+
+eval:
+  max_scans: null
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging:
+  mlflow:
+    enabled: true
+    tracking_uri: ${oc.env:MLFLOW_TRACKING_URI,"http://172.16.240.33:5000"}
+    experiment_name: ${oc.env:MLFLOW_EXPERIMENT_NAME,"rec"}
+    run_name: ${oc.env:MLFLOW_RUN_NAME,"${now:%Y%m%d_%H%M%S}_kroot_short"}
+    tags:
+      dataset: tus_rec24
+      model: kroot_short
+    log_system_metrics: false
+    artifact_subdir: artifacts
+    register_model: false
+    log_model_format: state_dict
+    best_metric: val_loss
+    best_mode: min
+
+runtime:
+  gpu_ids: "0"
+  multi_gpu: false
+
+checkpoint:
+  mlflow_run_id: null
+  mlflow_artifact: "checkpoints/best"
+  mlflow_search_best: true
+  local_path: null
+  load_on_eval: true
+  load_on_resume: true
+  strict: true
+
+viz:
+  enabled: true
+  drift_curve: true
+  pose_curve: true
+  recon_slices: false
+  save_png: true
+  save_csv: true
+  out_dir: null
