@@ -210,11 +210,19 @@ class MLflowHook(Hook):
         if not log_buffer:
             return
         step = int(log_buffer.get("global_step", 0))
+        # Always log loss and lr at the top level.
         metrics = {}
         if "loss" in log_buffer:
             metrics["train/loss"] = float(log_buffer["loss"])
         if "lr" in log_buffer:
             metrics["train/lr"] = float(log_buffer["lr"])
+        # Log all numeric breakdown metrics (dense_loss, sparse_loss, loss_ddf,
+        # drift_mm_last, grad_norm_rot_head, etc.) that trainers include in log_buffer.
+        _top_keys = {"loss", "lr", "epoch", "iter", "global_step", "mode", "k_stride"}
+        for key, value in log_buffer.items():
+            if key in _top_keys or not isinstance(value, (int, float)):
+                continue
+            metrics[f"train/{key}"] = float(value)
         if metrics:
             self.logger.log_metrics(metrics, step=step)
             self._log_metrics_local(phase="train_step", step=step, metrics=metrics)

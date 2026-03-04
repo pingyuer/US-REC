@@ -186,28 +186,43 @@ def main(argv=None) -> int:
             mlflow_hook.before_run(trainer, mode="test")
         eval_callbacks = [h for h in eval_hooks if hasattr(h, "on_end")]
 
-        evaluator = RecEvaluator(device=device)
-        eval_loader = getattr(trainer, "val_loader", None)
-        if eval_loader is None:
-            eval_loader = getattr(trainer, "val_loader_rec", None)
-        metrics = evaluator.run(
-            model=trainer.model,
-            loader=eval_loader,
-            cfg=cfg,
-            trainer=trainer,
-            mode="test",
-            callbacks=eval_callbacks,
-        )
+        # Dual-path trainer has its own evaluate() with fusion support
+        is_dual = hasattr(trainer, "fusion_mode")
+        if is_dual:
+            eval_loader = getattr(trainer, "val_loader", None)
+            metrics = trainer.evaluate(eval_loader)
+        else:
+            evaluator = RecEvaluator(device=device)
+            eval_loader = getattr(trainer, "val_loader", None)
+            if eval_loader is None:
+                eval_loader = getattr(trainer, "val_loader_rec", None)
+            metrics = evaluator.run(
+                model=trainer.model,
+                loader=eval_loader,
+                cfg=cfg,
+                trainer=trainer,
+                mode="test",
+                callbacks=eval_callbacks,
+            )
         print("\n=== Evaluation results ===")
         for k, v in sorted(metrics.items()):
             if k in ("tusrec_per_scan", "scan_globals"):
                 continue
-            if isinstance(v, float):
-                print(f"  {k:30s}: {v:.6f}")
+            if isinstance(v, (float, int)):
+                print(f"  {k:30s}: {v:.6f}" if isinstance(v, float) else f"  {k:30s}: {v}")
+            elif isinstance(v, str):
+                print(f"  {k:30s}: {v}")
         out_dir = str(dirs.get("run_dir", "eval_output"))
         export_results(metrics, out_dir=out_dir, save_json=True)
         print(f"\nResults saved to {out_dir}/")
+        # Push eval metrics to MLflow before closing the run.
+        # after_val skips non-numeric values (scan_globals, fusion_mode, etc.) automatically.
         if mlflow_hook is not None:
+            eval_log_buf: dict = {"epoch": 1}
+            for _k, _v in metrics.items():
+                if isinstance(_v, (int, float)):
+                    eval_log_buf[_k] = _v
+            mlflow_hook.after_val(trainer, log_buffer=eval_log_buf)
             mlflow_hook.after_run(trainer, mode="test")
         return 0
 
@@ -221,10 +236,24 @@ def main(argv=None) -> int:
     if OmegaConf.is_config(ckpt_cfg):
         ckpt_cfg = OmegaConf.to_container(ckpt_cfg, resolve=True)
     retain_epoch = int(getattr(trainer, "retain_epoch", 0) or 0)
+    is_dual = hasattr(trainer, "fusion_mode")
     if bool(ckpt_cfg.get("load_on_resume", True)) and (
         retain_epoch > 0 or args.checkpoint
     ):
-        load_checkpoint(trainer.model, cfg, device, ctx=ctx)
+        if is_dual and hasattr(trainer, "load_full_checkpoint"):
+            # Try full resume (model + optimizer + EMA + epoch)
+            from trainers.utils.checkpoint_loader import _resolve_local_path  # noqa: PLC0415
+            ckpt_path = _resolve_local_path(
+                str(dirs.get("run_dir", "")),
+                ckpt_cfg.get("local_path"),
+            )
+            if ckpt_path is not None:
+                trainer.load_full_checkpoint(str(ckpt_path))
+            else:
+                # Fall back to model-only loading
+                load_checkpoint(trainer.model, cfg, device, ctx=ctx)
+        else:
+            load_checkpoint(trainer.model, cfg, device, ctx=ctx)
 
     # Dispatch: LongSeqTrainer uses .train(); baseline uses .multi_model() + .train_rec_model()
     if hasattr(trainer, "multi_model"):

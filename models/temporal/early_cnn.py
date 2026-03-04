@@ -83,7 +83,13 @@ class FrameEncoder(nn.Module):
 
         # Optional projection to token_dim
         if token_dim is not None and token_dim != self.backbone_dim:
-            self.proj = nn.Linear(self.backbone_dim, token_dim)
+            self.proj = nn.Sequential(
+                nn.Linear(self.backbone_dim, token_dim),
+                nn.LayerNorm(token_dim),
+            )
+            # Xavier init for the projection — stabilises the output scale
+            nn.init.xavier_uniform_(self.proj[0].weight)
+            nn.init.zeros_(self.proj[0].bias)
             self.out_dim = token_dim
         else:
             self.proj = None

@@ -3,12 +3,20 @@
 Wraps ``TUSRecS3Iterable`` to yield contiguous windows of *T* frames
 (with ground-truth global transforms) instead of pairwise samples.
 
-Training: random windows of ``window_size`` frames from each scan.
-Eval:     full scan (all frames) as a single sample.
+Training modes:
+
+* **tiled** (default) — deterministic non-overlapping tiling.  Each frame
+  appears exactly once per epoch.  An epoch-dependent random offset (jitter)
+  shifts the tiling grid so tile boundaries vary across epochs.
+* **random** (legacy) — ``windows_per_scan`` random windows per scan; frames
+  in overlapping regions are processed multiple times.
+
+Eval:  full scan (all frames) as a single sample (unchanged).
 """
 
 from __future__ import annotations
 
+import math
 import random
 from typing import Iterable, List, Optional, Tuple
 
@@ -43,9 +51,22 @@ class ScanWindowDataset(torch.utils.data.IterableDataset):
     window_size : int
         Number of consecutive frames per sample (training).  Eval uses full scan.
     windows_per_scan : int
-        Number of random windows to extract from each scan during training.
+        (legacy *random* mode) Number of random windows from each scan.
+    sampling_mode : str
+        ``"tiled"`` (default) — non-overlapping tiles with epoch jitter;
+        ``"random"`` — legacy random-window sampling.
+    tile_overlap : int
+        Overlap between consecutive tiles (default 0 — no overlap).  A small
+        overlap (e.g. 8–16) gives the transformer context at tile boundaries.
+    min_tile_size : int
+        Minimum acceptable tile length.  Remainder tiles shorter than this
+        are merged into the preceding tile.  Default ``window_size // 2``.
+    max_tiles_per_scan : int
+        Maximum number of tiles per scan (0 = unlimited).  When a scan
+        produces more tiles than this, tiles are evenly subsampled.  Useful
+        for capping training cost on very long scans.
     mode : str
-        "train" → random windows; "val"/"test" → full scan.
+        "train" → tiled/random windows; "val"/"test" → full scan.
     seed : int
         RNG seed.
     """
@@ -55,6 +76,10 @@ class ScanWindowDataset(torch.utils.data.IterableDataset):
         base_dataset: TUSRecS3Iterable,
         window_size: int = 128,
         windows_per_scan: int = 1,
+        sampling_mode: str = "tiled",
+        tile_overlap: int = 0,
+        min_tile_size: int = 0,
+        max_tiles_per_scan: int = 0,
         mode: str = "train",
         seed: int = 0,
         augment_flip: bool = False,
@@ -66,6 +91,10 @@ class ScanWindowDataset(torch.utils.data.IterableDataset):
         self._base = base_dataset
         self.window_size = max(2, int(window_size))
         self.windows_per_scan = max(1, int(windows_per_scan))
+        self.sampling_mode = str(sampling_mode).lower()  # "tiled" or "random"
+        self.tile_overlap = max(0, int(tile_overlap))
+        self.min_tile_size = int(min_tile_size) if min_tile_size > 0 else self.window_size // 2
+        self.max_tiles_per_scan = max(0, int(max_tiles_per_scan))
         self.mode = str(mode).lower()
         self.seed = int(seed)
         self.epoch = 0
@@ -107,6 +136,102 @@ class ScanWindowDataset(torch.utils.data.IterableDataset):
         inv_first = torch.linalg.inv(tforms[0:1])  # (1, 4, 4)
         return inv_first @ tforms  # (T, 4, 4)
 
+    # ------------------------------------------------------------------
+    # Tiling helpers
+    # ------------------------------------------------------------------
+    def _compute_tile_starts(
+        self, T_total: int, rng: random.Random,
+    ) -> List[Tuple[int, int]]:
+        """Return a list of ``(start, end)`` for non-overlapping tiles.
+
+        * Tiles are ``window_size`` long with ``stride = window_size - tile_overlap``.
+        * An epoch-dependent random jitter shifts the grid so that tile
+          boundaries move across epochs (prevents fixed boundary artefacts).
+        * If the final tile is shorter than ``min_tile_size`` it is absorbed
+          into the previous tile (that tile grows slightly beyond ``window_size``).
+        """
+        W = min(self.window_size, T_total)
+        stride = max(1, W - self.tile_overlap)
+
+        # ── Epoch jitter: shift grid start by a random value in [0, stride) ──
+        max_jitter = min(stride, T_total - W) if T_total > W else 0
+        jitter = rng.randint(0, max_jitter) if max_jitter > 0 else 0
+
+        tiles: List[Tuple[int, int]] = []
+        pos = jitter
+        while pos + W <= T_total:
+            tiles.append((pos, pos + W))
+            pos += stride
+
+        # Handle any remainder beyond the last full tile
+        if pos < T_total:
+            remainder = T_total - pos
+            if remainder >= self.min_tile_size or not tiles:
+                # Remainder is large enough → keep as its own tile
+                tiles.append((pos, T_total))
+            else:
+                # Merge remainder into the previous tile (extend it)
+                prev_start, _ = tiles[-1]
+                tiles[-1] = (prev_start, T_total)
+
+        # If jitter left frames before the first tile, extend tile 0 leftward
+        if tiles and tiles[0][0] > 0:
+            first_start, first_end = tiles[0]
+            uncovered = first_start
+            if uncovered < self.min_tile_size:
+                # Extend tile 0 to start from 0
+                tiles[0] = (0, first_end)
+            else:
+                # Prepend a tile for the left margin
+                tiles.insert(0, (0, first_start + self.tile_overlap))
+
+        return tiles
+
+    # ------------------------------------------------------------------
+    # Per-window sample builder (shared between tiled and random paths)
+    # ------------------------------------------------------------------
+    def _make_sample(
+        self,
+        frames_t: torch.Tensor,
+        tforms_t: torch.Tensor,
+        start: int,
+        end: int,
+        scan_id: str,
+        info: SliceInfo,
+        T_total: int,
+        rng: random.Random,
+    ) -> dict:
+        """Extract and normalise a single window → sample dict."""
+        win_frames = frames_t[start:end].float().clone()
+        win_tforms = tforms_t[start:end].float().clone()
+
+        # Time-reversal augmentation
+        if self.augment_flip and rng.random() < self.flip_prob:
+            win_frames = win_frames.flip(0).contiguous()
+            win_tforms = win_tforms.flip(0).contiguous()
+
+        gt_global = self._normalise_global_transforms(win_tforms)
+        meta: dict = {
+            "scan_id": scan_id,
+            "subject": info.subject,
+            "scan_name": info.scan_name,
+            "window_start": start,
+            "window_size": end - start,
+            "total_frames": T_total,
+        }
+        if self.calib_matrix is not None:
+            meta["tform_calib"] = self.calib_matrix
+        if self.image_size is not None:
+            meta["image_size"] = list(self.image_size)
+        return {
+            "frames": win_frames,
+            "gt_global_T": gt_global,
+            "meta": meta,
+        }
+
+    # ------------------------------------------------------------------
+    # Main iteration
+    # ------------------------------------------------------------------
     def _iter_scan_windows(
         self,
         info: SliceInfo,
@@ -143,41 +268,34 @@ class ScanWindowDataset(torch.utils.data.IterableDataset):
             }
             return
 
-        # Training: random windows
-        W = min(self.window_size, T_total)
-        max_start = T_total - W
-        for _ in range(self.windows_per_scan):
-            start = rng.randint(0, max_start) if max_start > 0 else 0
-            end = start + W
-            win_frames = frames_t[start:end].float().clone()
-            win_tforms = tforms_t[start:end].float().clone()
-
-            # Time-reversal augmentation: flip frame order with probability
-            # flip_prob.  Reversing the global transforms along the time
-            # axis and then re-normalising produces the correct local
-            # transforms for the reversed sequence (new_L[j] = inv(old_L[T-j])).
-            if self.augment_flip and rng.random() < self.flip_prob:
-                win_frames = win_frames.flip(0).contiguous()
-                win_tforms = win_tforms.flip(0).contiguous()
-
-            gt_global = self._normalise_global_transforms(win_tforms)
-            meta = {
-                "scan_id": scan_id,
-                "subject": info.subject,
-                "scan_name": info.scan_name,
-                "window_start": start,
-                "window_size": W,
-                "total_frames": T_total,
-            }
-            if self.calib_matrix is not None:
-                meta["tform_calib"] = self.calib_matrix
-            if self.image_size is not None:
-                meta["image_size"] = list(self.image_size)
-            yield {
-                "frames": win_frames,
-                "gt_global_T": gt_global,
-                "meta": meta,
-            }
+        # ── Training: tiled (default) or random ─────────────────────────
+        if self.sampling_mode == "random":
+            # Legacy random-window sampling
+            W = min(self.window_size, T_total)
+            max_start = T_total - W
+            for _ in range(self.windows_per_scan):
+                start = rng.randint(0, max_start) if max_start > 0 else 0
+                yield self._make_sample(
+                    frames_t, tforms_t, start, start + W,
+                    scan_id, info, T_total, rng,
+                )
+        else:
+            # Tiled sampling — each frame seen (approximately) once per epoch
+            tiles = self._compute_tile_starts(T_total, rng)
+            # Cap number of tiles for very long scans
+            if self.max_tiles_per_scan > 0 and len(tiles) > self.max_tiles_per_scan:
+                # Evenly subsample tiles to keep spatial diversity
+                step = len(tiles) / self.max_tiles_per_scan
+                selected = [tiles[int(i * step)] for i in range(self.max_tiles_per_scan)]
+                tiles = selected
+            # Shuffle tile order within this scan so that consecutive batches
+            # come from different parts of the scan.
+            rng.shuffle(tiles)
+            for start, end in tiles:
+                yield self._make_sample(
+                    frames_t, tforms_t, start, end,
+                    scan_id, info, T_total, rng,
+                )
 
     def __iter__(self):
         ddp_rank, ddp_world = self._resolve_rank_info()

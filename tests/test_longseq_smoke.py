@@ -274,13 +274,14 @@ class TestMiniTrain:
         B, T, H, W = 1, 8, 32, 32
         frames = torch.rand(B, T, H, W)
         gt_global = torch.eye(4).unsqueeze(0).unsqueeze(0).repeat(B, T, 1, 1)
+        torch.manual_seed(1)  # separate seed for GT walk (reproducible non-trivial target)
         for i in range(1, T):
             step = torch.eye(4)
             step[:3, 3] = torch.randn(3) * 0.3
             gt_global[:, i] = gt_global[:, i - 1] @ step
 
         losses = []
-        for _ in range(5):
+        for _ in range(30):
             optimizer.zero_grad()
             out = model(frames)
             loss, _ = longseq_loss(
@@ -293,8 +294,12 @@ class TestMiniTrain:
             optimizer.step()
             losses.append(loss.item())
 
-        assert losses[-1] < losses[0], (
-            f"Loss did not decrease: {losses[0]:.4f} → {losses[-1]:.4f}"
+        # The 3-layer decoder + LayerNorm can oscillate early; check that
+        # the average of the last 5 steps is below the average of the first 5.
+        first5 = sum(losses[:5]) / 5
+        last5 = sum(losses[-5:]) / 5
+        assert last5 < first5, (
+            f"Loss did not decrease over 30 steps: first5_avg={first5:.4f} last5_avg={last5:.4f}"
         )
 
 

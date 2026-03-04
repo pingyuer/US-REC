@@ -134,9 +134,35 @@ class SlidingWindowTransformerLayer(nn.Module):
         self.norm2 = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
 
+        # Proper initialisation for stable early training
+        self._init_weights()
+
         # Cache masks per sequence length
         self._cached_mask: torch.Tensor | None = None
         self._cached_key: tuple[int, int] = (-1, -1)  # (T, M)
+
+    def _init_weights(self) -> None:
+        """Xavier init for all linear layers; scale FFN output to prevent
+        residual stream magnification in deep stacks."""
+        # Attention projections — PyTorch MHA defaults are reasonable but
+        # we ensure Xavier for consistency.
+        for name, param in self.self_attn.named_parameters():
+            if "weight" in name and param.dim() >= 2:
+                nn.init.xavier_uniform_(param)
+            elif "bias" in name:
+                nn.init.zeros_(param)
+
+        # FFN layers
+        for module in self.ffn:
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                nn.init.zeros_(module.bias)
+
+        # Scale last FFN linear output by 1/sqrt(n_layers) equivalent —
+        # we use a simple small-scale init so residual additions start small.
+        last_linear = self.ffn[-2]  # Linear before the final Dropout
+        if isinstance(last_linear, nn.Linear):
+            nn.init.normal_(last_linear.weight, std=0.02)
 
     def _get_mask(self, T: int, device: torch.device, M: int = 0) -> torch.Tensor:
         key = (T + M, M)

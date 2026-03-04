@@ -15,6 +15,7 @@ from torch.optim.optimizer import Optimizer
 from data.builder import build_dataset
 from trainers.context import TrainingContext
 from trainers.hooks import LoggerHook, MLflowHook, VizHook
+from trainers.hooks.checkpoint_hook import CheckpointHook
 
 
 # Optimizer registry for easy extension
@@ -209,6 +210,10 @@ def _build_scan_window_loaders(
     ds_cfg = OmegaConf.select(cfg, "dataset") or {}
     window_size = int(ds_cfg.get("sequence_window", 128))
     windows_per_scan = int(ds_cfg.get("windows_per_scan", 1))
+    sampling_mode = str(ds_cfg.get("sampling_mode", "tiled"))
+    tile_overlap = int(ds_cfg.get("tile_overlap", 0))
+    min_tile_size = int(ds_cfg.get("min_tile_size", 0))
+    max_tiles_per_scan = int(ds_cfg.get("max_tiles_per_scan", 0))
     seed = int(OmegaConf.select(cfg, "seed") or 0)
     augment_flip = bool(ds_cfg.get("augment_flip", False))
     flip_prob = float(ds_cfg.get("flip_prob", 0.5))
@@ -255,6 +260,10 @@ def _build_scan_window_loaders(
             base_dataset=dset_train,
             window_size=window_size,
             windows_per_scan=windows_per_scan,
+            sampling_mode=sampling_mode,
+            tile_overlap=tile_overlap,
+            min_tile_size=min_tile_size,
+            max_tiles_per_scan=max_tiles_per_scan,
             mode="train",
             seed=seed,
             augment_flip=augment_flip,
@@ -377,6 +386,22 @@ def build_hooks(cfg: Any, ctx: TrainingContext, trainer: Any = None) -> Sequence
                 logger=mlflow_hook.logger,
             )
         )
+
+    # CheckpointHook — save best & last model checkpoints
+    ckpt_cfg = OmegaConf.select(cfg, "checkpoint") or {}
+    run_dir = str(getattr(ctx, "run_dir", None) or ".")
+    ckpt_dir = os.path.join(run_dir, "checkpoints")
+    hooks.append(
+        CheckpointHook(
+            interval=int(ckpt_cfg.get("save_interval", 0)),
+            dirpath=ckpt_dir,
+            metric_name=str(ckpt_cfg.get("best_metric", "val_loss")),
+            mode=str(ckpt_cfg.get("best_mode", "min")),
+            save_best=True,
+            save_last=True,
+            save_optimizer=bool(ckpt_cfg.get("save_optimizer", True)),
+        )
+    )
 
     return hooks
 

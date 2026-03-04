@@ -13,6 +13,7 @@ from typing import Sequence
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from utils.rotation import (
     rotation_rep_to_rotmat,
@@ -22,19 +23,37 @@ from utils.rotation import (
 
 
 class _PoseDecoder(nn.Module):
-    """Small MLP: concatenated context → pose parameters → SE(3) matrix."""
+    """MLP: concatenated context → pose parameters → SE(3) matrix.
+
+    Three-layer MLP with LayerNorm and residual connection for stable
+    gradient flow.  Output bias is set to identity so the initial
+    prediction is the identity transform (near-zero loss at init).
+    """
 
     def __init__(self, d_input: int, d_hidden: int, rotation_rep: str = "rot6d"):
         super().__init__()
         self.rotation_rep = rotation_rep
         rot_dim = ROTATION_REP_DIM[rotation_rep] - 3  # rotation-only dim
         self.rot_dim = rot_dim
-        self.mlp = nn.Sequential(
-            nn.Linear(d_input, d_hidden),
-            nn.GELU(),
-            nn.Linear(d_hidden, rot_dim + 3),  # rotation params + translation
-        )
+        out_dim = rot_dim + 3  # rotation params + translation
+
+        # Three-layer MLP with LayerNorm + GELU
+        self.norm_in = nn.LayerNorm(d_input)
+        self.fc1 = nn.Linear(d_input, d_hidden)
+        self.norm1 = nn.LayerNorm(d_hidden)
+        self.fc2 = nn.Linear(d_hidden, d_hidden)
+        self.norm2 = nn.LayerNorm(d_hidden)
+        self.fc_out = nn.Linear(d_hidden, out_dim)
+
+        self._init_weights()
         self._init_identity_bias()
+
+    def _init_weights(self) -> None:
+        """Xavier init for hidden layers — prevents vanishing / exploding
+        activations at initialisation."""
+        for layer in (self.fc1, self.fc2):
+            nn.init.xavier_uniform_(layer.weight)
+            nn.init.zeros_(layer.bias)
 
     def _init_identity_bias(self) -> None:
         """Set the output layer bias so the initial prediction is near-identity.
@@ -42,10 +61,8 @@ class _PoseDecoder(nn.Module):
         This avoids random rotations at initialisation which create large
         initial geodesic loss and slow convergence.
         """
-        last_linear = self.mlp[-1]
-        # Small weights so initial predictions are dominated by the bias
-        # (near-identity) but gradients still flow.
-        nn.init.normal_(last_linear.weight, std=1e-4)
+        # Very small weights → output dominated by bias (near-identity)
+        nn.init.normal_(self.fc_out.weight, std=1e-4)
         bias = torch.zeros(self.rot_dim + 3)
         if self.rotation_rep == "rot6d":
             # rot6d identity: first column [1,0,0], second column [0,1,0]
@@ -54,7 +71,7 @@ class _PoseDecoder(nn.Module):
             # quaternion identity: [1, 0, 0, 0]
             bias[:4] = torch.tensor([1.0, 0.0, 0.0, 0.0])
         # translation stays at zero (identity)
-        last_linear.bias = nn.Parameter(bias)
+        self.fc_out.bias = nn.Parameter(bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -66,7 +83,14 @@ class _PoseDecoder(nn.Module):
         -------
         T : (..., 4, 4) rigid transformation matrix
         """
-        raw = self.mlp(x)                          # (..., rot_dim + 3)
+        h = self.norm_in(x)
+        h = F.gelu(self.fc1(h))
+        # Residual through hidden layers (if dimensions match)
+        h2 = self.norm1(h)
+        h2 = F.gelu(self.fc2(h2))
+        h = h + self.norm2(h2)              # residual connection
+        raw = self.fc_out(h)                # (..., rot_dim + 3)
+
         rot_param = raw[..., : self.rot_dim]        # (..., rot_dim)
         t = raw[..., self.rot_dim :]                # (..., 3)
         R = rotation_rep_to_rotmat(rot_param, self.rotation_rep)  # (..., 3, 3)

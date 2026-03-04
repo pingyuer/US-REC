@@ -1,17 +1,17 @@
-# Long-sequence (Early-CNN + Temporal Transformer) config for TUS-REC-24.
+# Dual-path Transformer (Dense Δ=1 + Sparse Δ=k) config for TUS-REC-24.
 #
-# Two-stage architecture:
-#   1. Per-frame EfficientNet encoder  → frame tokens
-#   2. Causal sliding-window Transformer → context tokens
-#   3. LocalPoseHead (Δ=1) + MultiIntervalHead (Δ∈{2,4,8,16})
+# Architecture:
+#   1. Shared per-frame EfficientNet-B1 encoder → frame tokens
+#   2a. Dense Transformer (sliding-window causal) → DenseHead → T_{i-1←i}
+#   2b. Sparse Transformer (large/full window)    → SparseHead → T_{(m-1)k←mk}
 #
-# Multi-interval auxiliary supervision + consistency constraint to
-# reduce global drift (GPE).
+# Training: Dense loss + Sparse loss (no auxΔ, no consistency constraint).
+# Eval: Anchor-correction fusion (or pose-graph) → fused global → TUS-REC metrics.
 #
-# Run modes (from project root):
-#   Train:      python main_rec.py --config configs/demo_rec24_ete_longseq.yml
-#   Smoke eval: python -m trainers.longseq_trainer  (see bottom of that file)
-#   Test:       pytest tests/test_longseq_smoke.py -v
+# Run modes:
+#   Train:       python main_rec.py --config configs/demo_rec24_ete_dual_tf.yml
+#   Smoke eval:  python main_rec.py --config configs/demo_rec24_ete_dual_tf.yml --eval-smoke
+#   Dry run:     python main_rec.py --config configs/demo_rec24_ete_dual_tf.yml --dry-run
 
 # ---------------------------------------------------------------------------
 # Reproducibility
@@ -31,55 +31,56 @@ paths:
 # Model
 # ---------------------------------------------------------------------------
 model:
-  # Switch between baseline pairwise ("efficientnet_b1") and new longseq model.
-  type: longseq_transformer  # "longseq_transformer" | "baseline"
-  name: efficientnet_b1      # kept for baseline fallback
-  pred_type: parameter
-  label_type: transform
-  in_ch_reg: 1
-  ddf_dirc: Move
-  conv_coords: optimised_coord
-  img_pro_coord: pro_coord
-  batch_norm: BNoff
-  use_voxelmorph: false
-  use_deform: false
-  use_backward: false
-  enable_voxel: false
-  interpolation:
-    method: bilinear
-    volume: fixed_interval
+  type: dual_transformer
+  k_stride: 8              # Sparse branch stride (Δ=k)
+
   pose_head:
-    rotation_rep: rot6d   # "rot6d" recommended for transformer head
+    rotation_rep: rot6d     # 6D continuous rotation (Gram-Schmidt)
 
-  # Early-CNN encoder parameters
+  # Shared Early-CNN encoder
   encoder:
-    backbone: efficientnet_b1     # b1 has more capacity, matches paper
-    pretrained: true              # use ImageNet init; 1-ch avg handled in FrameEncoder
+    backbone: efficientnet_b1
+    pretrained: true
 
-  # Temporal Transformer parameters
+  # Common transformer dimension (shared between branches)
   transformer:
     d_model: 256
-    n_heads: 4
-    n_layers: 4
-    dim_feedforward: 1024
-    window_size: 64          # sliding-window attention span within a segment
     dropout: 0.1
-    # Transformer-XL style segment recurrence:
-    #   seg_len  — training sequence is split into chunks of this many frames;
-    #              memory tokens are passed between segments (stop-grad).
-    #   mem_len  — documentation alias; maps to memory_size in the model.
-    #   memory_size — number of hidden-state tokens carried cross-segment.
-    #   Set memory_size: 0 to disable (single-pass, original behaviour).
-    seg_len: 128             # frames per training segment (0 = single-pass)
-    mem_len: 32              # alias; matches memory_size below
-    memory_size: 32          # carry 32 context tokens across segment boundaries
 
-  # Image dimensions for DDF pixel sampling (H x W)
+  # Dense branch (Δ=1): sliding-window causal attention
+  dense:
+    transformer:
+      n_heads: 4
+      n_layers: 4
+      dim_feedforward: 1024
+      window_size: 64
+
+  # Sparse branch (Δ=k): larger window / near-full attention on short subsequence
+  sparse:
+    transformer:
+      n_heads: 4
+      n_layers: 4
+      dim_feedforward: 1024
+      window_size: 256       # effectively full attention for T/k ≈ 16 anchors
+
+  # Image dimensions for reference
   image_size_h: 480
   image_size_w: 640
 
 # ---------------------------------------------------------------------------
-# Dataset (S3-backed)
+# Fusion (eval-time)
+# ---------------------------------------------------------------------------
+fusion:
+  mode: anchor_interp       # "anchor_interp" | "pose_graph"
+  anchor_smooth: true        # SE(3) log-space interpolation between corrections
+  # Pose-graph parameters (only used when mode=pose_graph)
+  pose_graph:
+    n_iters: 20
+    huber_delta: 0.1
+    sparse_info_weight: 2.0
+
+# ---------------------------------------------------------------------------
+# Dataset (S3-backed) — same as longseq config
 # ---------------------------------------------------------------------------
 dataset:
   name: data.datasets.TUS_rec_s3.TUSRecS3Iterable
@@ -130,7 +131,7 @@ dataset:
     num_samples: 100
     sample_range: 100
 
-  # Scan-window mode (for longseq trainer)
+  # Scan-window mode
   sequence_mode: scan_window
   sequence_window: 128
   sampling_mode: tiled          # "tiled" (non-overlapping, no redundancy) or "random" (legacy)
@@ -139,17 +140,15 @@ dataset:
   max_tiles_per_scan: 0         # 0 = unlimited; set e.g. 4 to cap cost on very long scans
   windows_per_scan: 4           # only used when sampling_mode=random
 
-  # Time-reversal augmentation for scan-window training
-  # augment.reverse_prob is the preferred key; legacy augment_flip/flip_prob
-  # are kept as fallbacks for backward compatibility.
-  augment_flip: true            # kept for backward compat
+  # Time-reversal augmentation
+  augment_flip: true
   flip_prob: 0.5
   augment:
-    reverse_prob: 0.5           # preferred key; overrides flip_prob when set
+    reverse_prob: 0.5
 
 dataloader:
   train:
-    batch_size: 1          # sequence mode: 1 scan-window per batch
+    batch_size: 1
     num_workers: 0
     shuffle: false
     drop_last: false
@@ -168,63 +167,56 @@ dataloader:
     pin_memory: false
 
 # ---------------------------------------------------------------------------
-# Optimizer
+# Optimizer — AdamW + warm-up + cosine schedule
 # ---------------------------------------------------------------------------
 optimizer:
-  type: adam
-  lr_rec: 1e-4
-  lr_reg: 1e-4
+  type: adamw
+  lr_rec: 5e-4                # peak learning rate (after warm-up)
+  weight_decay: 0.01          # decoupled weight decay (AdamW)
+  betas: [0.9, 0.999]
+  min_lr: 1e-6                # cosine schedule floor
+  warmup_steps: 20            # ~5-10% of total steps; was 200 (too long)
+  encoder_lr_mult: 0.1        # encoder LR = lr_rec × 0.1 (pretrained → lower LR)
 
 lr_scheduler:
   type: null
 
 # ---------------------------------------------------------------------------
-# Loss
+# Loss — dual path, NO auxΔ, smooth losses
 # ---------------------------------------------------------------------------
 loss:
-  type: MSE_points           # baseline path (used by pairwise trainer)
-  reg_weight: 1000
-  alpha_def: 0.0
-  alpha_voxel: 0.0
-  rot_loss: geodesic
-  trans_loss: l2
+  # Rotation: chordal (Frobenius) distance — smooth everywhere, no acos
+  # Translation: smooth L1 (Huber) — robust to outlier frames
+  rot_loss: chordal
+  trans_loss: smooth_l1
   rot_weight: 1.0
   trans_weight: 1.0
+  dense_weight: 1.0
+  sparse_weight: 1.0
 
-  # Long-sequence multi-interval auxiliary supervision
-  # Δ=32 adds long-range context aligned with Qi Li's dependency analysis
-  aux_intervals: [2, 4, 8, 16, 32]
-  aux_weight: 0.5            # base weight for auxiliary losses
-  aux_decay: 0.5             # multiplicative decay per interval rank; wΔ = aux_weight * decay^rank
-  aux_scale: none            # "none" (recommended for points mode) | "delta" | "delta2"
+  # Explicitly disabled — no multi-interval aux losses
+  aux_intervals: []
+  aux_weight: 0.0
+  aux_decay: 0.0
+  consistency_weight: 0.0
 
-  # Points-based loss mode: rotation error is encoded in point displacement,
-  # so no separate rot/trans weighting is needed.
-  mode: points               # "points" (default) | "se3" (ablation)
-  ref_pts_scale_mm: 20.0     # half-span of reference square in mm
-
-  # DDF surrogate loss: sample random pixels, map through calib, apply global T.
-  # Matches the TUS-REC evaluation oracle.  Requires dataset.calib_file.
-  # 0.05 is a conservative starting weight; increase to 0.1-0.2 once stable.
-  ddf_sample_weight: 0.05    # was 0.0; set >0 to align training with GPE oracle
-  ddf_num_points: 1024       # random pixels per batch
-
-  # Consistency constraint
-  consistency_weight: 0.1
-  consistency_delta: 2
+  mode: se3
 
 # ---------------------------------------------------------------------------
 # Trainer
 # ---------------------------------------------------------------------------
 trainer:
-  name: trainers.longseq_trainer.LongSeqTrainer
+  name: trainers.dual_trainer.DualTrainer
   max_epochs: 3
   log_interval: 50
+  grad_accum_steps: 4         # accumulate 4 tiles → effective batch ≈ 4 sequences
+  max_grad_norm: 1.0          # gradient clipping max-norm
+  ema_decay: 0.999            # exponential moving average (0 = disabled)
   validate_every: 1
   save_interval: 100
   info_interval: 1
   retain_epoch: "00000000"
-  grad_accum: 4              # effective batch = batch_size × grad_accum = 4
+  grad_accum: 4
   mode:
     inter: nointer
     meta: nonmeta
@@ -252,10 +244,6 @@ data:
 
 eval:
   max_scans: null
-  # Metric mode for evaluate():
-  #   "points"     — fast ref-point L2 proxy, no calib needed
-  #   "tusrec_ddf" — official TUS-REC DDF (GPE_mm/LPE_mm/final_score)
-  #                  requires dataset.calib_file to be set
   metric_mode: tusrec_ddf
 
 # ---------------------------------------------------------------------------
@@ -266,10 +254,10 @@ logging:
     enabled: true
     tracking_uri: ${oc.env:MLFLOW_TRACKING_URI,"http://172.16.240.33:5000"}
     experiment_name: ${oc.env:MLFLOW_EXPERIMENT_NAME,"rec"}
-    run_name: ${oc.env:MLFLOW_RUN_NAME,"${now:%Y%m%d_%H%M%S}_longseq"}
+    run_name: ${oc.env:MLFLOW_RUN_NAME,"${now:%Y%m%d_%H%M%S}_dual_tf"}
     tags:
       dataset: tus_rec24
-      model: longseq_transformer
+      model: dual_transformer
     log_system_metrics: false
     artifact_subdir: artifacts
     register_model: false
@@ -292,6 +280,11 @@ checkpoint:
   load_on_eval: true
   load_on_resume: true
   strict: true
+  # CheckpointHook settings
+  save_interval: 0            # 0 = no periodic epoch checkpoints; set 1 to save every epoch
+  best_metric: val_loss       # metric key for best-model tracking (mean_gpe_mm mapped to val_loss)
+  best_mode: min              # "min" = lower is better (lower GPE = better)
+  save_optimizer: true        # include optimizer + EMA in checkpoint for full resume
 
 # ---------------------------------------------------------------------------
 # Visualisation

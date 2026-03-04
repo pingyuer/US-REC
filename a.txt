@@ -1,0 +1,154 @@
+下面是一份**“两路网络（Δ=1 + Δ=k）+ eval 融合/插值”的实现清单式 prompt**，你可以直接复制给编程 AI。按你的要求：不再使用多间隔损失（auxΔ 全部移除），改为两路网络各自训练，各自输出一套预测，eval 端再融合得到最终轨迹，然后转成 tusrec 的 GP/LP DDF 去评测/导出。TUS-REC 的官方评测明确是基于 GP/LP displacement vectors（DDF, mm）计算 GPE/LPE。  ￼
+
+⸻
+
+Prompt：双路 Transformer（Δ=1 & Δ=k）+ Eval 融合插值（新配置驱动，替代 auxΔ）
+
+目标：实现一个新的配置 configs/demo_rec24_ete_dual_tf.yml，启用双路网络：
+	•	DenseTransformer（Δ=1 相邻）：专注预测每一步相邻变换 T_{i-1\leftarrow i}
+	•	SparseTransformer（Δ=k 间隔）：专注预测每 k 帧的长跳变换 T_{i-k\leftarrow i}（在稀疏子序列上做相邻预测）
+
+训练时：
+	•	Dense 只训练 Δ=1
+	•	Sparse 只训练 Δ=k
+	•	彻底移除多间隔辅助损失（auxΔ2/4/8/16/32）与其相关日志/代码路径
+
+推理/eval 时：
+	•	得到两套预测边（Δ=1、Δ=k）
+	•	在 eval 端融合/插值生成最终 全帧 global transforms T_{0\leftarrow i}，再按 tusrec 要求生成 GP/LP DDF 并算指标/导出。  ￼
+
+⸻
+
+A. 新增/调整模块清单
+
+A1) 模型结构：共享 Early-CNN 编码器 + 两个 Transformer 分支
+
+实现 models/dual_pose_model.py：
+	•	FrameEncoder：逐帧 CNN 编码 I_i \to z_i
+	•	DenseTransformer：输入 tokens (z_0..z_{T-1})，输出 ctx (h_0..h_{T-1})
+	•	DenseHead：用 (h_{i-1},h_i) 预测 \hat{T}^{(1)}_{i-1\leftarrow i}
+	•	SparseTransformer：输入稀疏 tokens (z_0,z_k,z_{2k},...)，输出 ctx_k
+	•	SparseHead：预测稀疏相邻变换 \hat{T}^{(k)}_{(m-1)k \leftarrow mk}（等价原序列 Δ=k）
+
+Transformer 内部建议使用 sliding-window causal attention（dense）与较大窗口或全局 attention（sparse），并支持 memory tokens/segment recurrence（可选）。Transformer-XL 的“segment-level recurrence”用于缓解 context fragmentation；若你实现 memory，优先用相对位置编码或 memory token 机制。  ￼
+
+A2) 旋转参数化（建议固定 rot6d）
+	•	使用 6D rotation rep → Gram-Schmidt 正交化得到 R，保证 det(R)=+1
+	•	不用四元数（除非你已有成熟实现）。6D 的连续性更适合 NN 学习。  ￼
+
+⸻
+
+B. 数据与采样（两路网络各自取样，但都来自同一条 scan window）
+
+你现有 sequence_mode: scan_window 保留，训练 sample 仍是一个窗口：
+	•	frames: (B,T,C,H,W)（例如 T=128）
+	•	gt_global_T: (B,T,4,4) 窗口内 global（frame0=I）
+
+在一个窗口里构造监督：
+
+B1) Dense（Δ=1）监督数据
+	•	gt_local_1[i] = inv(gt_global[i-1]) @ gt_global[i]，i=1..T-1
+
+B2) Sparse（Δ=k）监督数据
+	•	抽取 anchor index：idx = [0, k, 2k, ...]（<=T-1）
+	•	anchor global：gt_global_anchor[m] = gt_global[idx[m]]
+	•	sparse local（相邻 anchor）：
+gt_local_k[m] = inv(gt_global_anchor[m-1]) @ gt_global_anchor[m]
+
+⸻
+
+C. 训练策略（关键：不再用 auxΔ）
+
+C1) 两路各自 loss
+	•	Dense loss：只对 gt_local_1 做 pose loss（se3 / points loss 二选一，推荐 points 与 tusrec 更贴近）
+	•	Sparse loss：只对 gt_local_k 做 pose loss
+
+不允许再计算任何 auxΔ2/4/8/16/32 的损失；删掉相关项、日志与配置。
+
+C2) 两路共享或分开优化器
+
+二选一：
+	•	共享 encoder：同一个 optimizer，loss = dense_loss + λ * sparse_loss
+	•	或者 encoder 共享但用两组 optimizer（不推荐，复杂）
+
+⸻
+
+D. Eval 融合（“两套预测结果 + 插值/校正”）
+
+你要求 eval 端有两套预测并融合。实现 eval/dual_fusion.py，提供两种融合模式（config 可选）：
+
+D1) Anchor 校正 + SE(3) 插值（最像“插值融合”，实现简单）
+
+步骤：
+	1.	Dense 生成初始 global：
+	•	T0_dense[0]=I
+	•	T0_dense[i]=T0_dense[i-1] @ T_local1_pred[i]
+	2.	Sparse 生成 anchor global（仅 anchor 点）：
+	•	T0_sparse_anchor[0]=I
+	•	T0_sparse_anchor[m]=T0_sparse_anchor[m-1] @ T_localk_pred[m]
+	•	将它映射回原序列帧号：anchor frame = m*k
+	3.	对每个 anchor 区间 [mk, (m+1)k]：
+	•	计算左乘校正：C_m = T0_sparse_anchor[m] @ inv(T0_dense[mk])
+	•	区间内校正：T0_fused[i] = C_m @ T0_dense[i]
+	4.	平滑过渡（可选）：在 SE(3) 李代数上对 C_m 与 C_{m+1} 做线性插值（避免区间边界跳变）
+
+输出：T0_fused[i] for all i。
+
+D2) Pose Graph Optimization（更“原则正确”，可做成可选项）
+	•	节点：每帧全局位姿 X_i
+	•	边：
+	•	Dense：Z^{(1)}_{i-1,i}\approx X_{i-1}^{-1}X_i
+	•	Sparse：Z^{(k)}_{i-k,i}\approx X_{i-k}^{-1}X_i（只在 anchor 上或映射到帧号）
+	•	优化：最小二乘 + 鲁棒核（Huber），输出 fused 的 X_i
+
+这是经典图优化思路：多种相对位姿约束边融合，能显著抑制 drift。可参考图优化 SLAM 讲义。  ￼
+
+⸻
+
+E. 输出与评测：严格走 tusrec 口径
+
+Eval 得到 T0_fused 后，生成：
+	•	LP：用 fused local（从 fused global 反推）得到 LP DDF
+	•	GP：用 fused global 得到 GP DDF
+然后调用你现有 compute_tusrec_metrics() 产出：
+	•	GPE_mm, LPE_mm, *_score, final_score, runtime_*  ￼
+
+⸻
+
+F. 新配置文件 configs/demo_rec24_ete_dual_tf.yml
+
+必须包含（示例字段）：
+	•	model.type: dual_transformer
+	•	model.k_stride: 8（可调）
+	•	model.dense.transformer.window_size: 64
+	•	model.sparse.transformer.window_size: 256（或 full attention）
+	•	fusion.mode: ["anchor_interp" | "pose_graph"]
+	•	fusion.anchor_smooth: true/false
+	•	loss.dense_weight, loss.sparse_weight
+	•	train.sequence_window: 128
+	•	明确关闭旧的 aux_intervals / consistency / ddf_multi_interval 等（删除或置空）
+
+⸻
+
+G. 交付与验收
+	1.	代码改动：
+
+	•	新增 models/dual_pose_model.py
+	•	新增 eval/dual_fusion.py
+	•	新增 config demo_rec24_ete_dual_tf.yml
+	•	Trainer/eval 入口支持 model.type=dual_transformer
+	•	移除 auxΔ 相关实现与日志
+
+	2.	smoke eval：
+
+	•	max_scans=2, max_frames=128 跑通
+	•	输出 fused tusrec 指标（GPE/LPE/final_score）
+
+	3.	运行时日志：
+
+	•	Dense loss、Sparse loss、fusion mode、k 值
+	•	fused 的 tusrec 指标（不要再混用 se3 proxy 命名）
+
+⸻
+
+如果你希望 k 不是固定而是多尺度（k=8 与 k=16 两个 sparse 分支），可以在这个框架下扩展：多个 SparseTransformer 输出多个 anchor 约束，在 pose graph 模式里就是多一组边。
