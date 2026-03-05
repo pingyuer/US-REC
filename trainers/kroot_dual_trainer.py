@@ -8,6 +8,9 @@ Each training step draws one batch from the short loader and one batch from
 the long loader, computing separate losses for each model.  Both models use
 AdamW with linear warm-up + cosine annealing LR and optional EMA.
 
+Now inherits from :class:`BaseTrainer` for shared boilerplate (hooks,
+checkpoint, gradient accumulation, LR schedule, train loop skeleton).
+
 Evaluation runs the full stitch pipeline from ``eval.kroot_stitch``:
 long anchors provide the global skeleton, short provides dense refinement,
 fused via SE(3) log-space endpoint correction.
@@ -33,7 +36,7 @@ import math
 import os
 import time
 import warnings
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -48,71 +51,62 @@ from eval.kroot_stitch import (
     compute_stitch_metrics,
     export_debug_csv,
 )
-from trainers.hooks.base_hook import Hook
+from trainers.base_trainer import BaseTrainer
+from trainers.common import cfg_get, EMA, load_tform_calib, resolve_kroot_stride
 
 
-def _cfg_get(cfg, path, default=None):
-    val = OmegaConf.select(cfg, path)
-    return default if val is None else val
+# ─── Helper: zip loaders (legacy dual-loader mode) ──────────────────────────
 
+class _ZipCycleLoader:
+    """Zip short + long loaders; cycle long if shorter.
 
-# ─── EMA helper ──────────────────────────────────────────────────────────────
+    Yields ``{"short": short_batch, "long": long_batch}`` — same format
+    as the joint loader so ``_run_step`` sees a uniform interface.
+    """
 
-class _EMA:
-    """Exponential Moving Average of model parameters."""
+    def __init__(self, short_loader, long_loader):
+        self.short = short_loader
+        self.long = long_loader
 
-    def __init__(self, model: nn.Module, decay: float = 0.999):
-        self.decay = decay
-        self.shadow: dict[str, torch.Tensor] = {}
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                self.shadow[name] = param.data.clone()
+    def __iter__(self):
+        long_iter = iter(self.long)
+        for short_batch in self.short:
+            try:
+                long_batch = next(long_iter)
+            except StopIteration:
+                long_iter = iter(self.long)
+                long_batch = next(long_iter)
+            yield {"short": short_batch, "long": long_batch}
 
-    @torch.no_grad()
-    def update(self, model: nn.Module) -> None:
-        for name, param in model.named_parameters():
-            if name in self.shadow:
-                self.shadow[name].mul_(self.decay).add_(param.data, alpha=1 - self.decay)
-
-    def apply(self, model: nn.Module) -> dict[str, torch.Tensor]:
-        backup = {}
-        for name, param in model.named_parameters():
-            if name in self.shadow:
-                backup[name] = param.data.clone()
-                param.data.copy_(self.shadow[name])
-        return backup
-
-    @staticmethod
-    def restore(model: nn.Module, backup: dict[str, torch.Tensor]) -> None:
-        for name, param in model.named_parameters():
-            if name in backup:
-                param.data.copy_(backup[name])
-
-
-# ─── LR schedule ────────────────────────────────────────────────────────────
-
-def _warmup_cosine_lr(step: int, warmup_steps: int, total_steps: int,
-                       base_lr: float, min_lr: float = 1e-6) -> float:
-    if step < warmup_steps:
-        return min_lr + (base_lr - min_lr) * step / max(1, warmup_steps)
-    progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-    return min_lr + 0.5 * (base_lr - min_lr) * (1 + math.cos(math.pi * progress))
+    def __len__(self):
+        return len(self.short)
 
 
 # ==========================================================================
 # KRootDualTrainer
 # ==========================================================================
 
-class KRootDualTrainer:
+class KRootDualTrainer(BaseTrainer):
     """Joint trainer for both K-root branches (short + long).
+
+    Inherits generic train loop, hooks, checkpoint from :class:`BaseTrainer`.
+    Adds: dual-model construction, branch-specific forward, stitch eval, EMA.
+
+    Supports two loader modes:
+    1. **Joint loader** (preferred): a single ``joint_train_loader`` that
+       yields ``{"short": …, "long": …, "meta": …}`` — one scan read,
+       one batch, one backward.
+    2. **Legacy dual loaders**: separate ``short_train_loader`` +
+       ``long_train_loader``.  Kept for backward compatibility but slower.
 
     Parameters
     ----------
     cfg : OmegaConf config
     device : str | torch.device
-    short_train_loader : DataLoader for ShortWindowDataset (train)
-    long_train_loader : DataLoader for LongWindowDataset (train)
-    val_loader : DataLoader for full-scan validation (ShortWindowDataset in val mode)
+    joint_train_loader : DataLoader for JointKRootDualDataset (preferred)
+    short_train_loader : DataLoader for ShortWindowDataset (legacy)
+    long_train_loader : DataLoader for LongWindowDataset (legacy)
+    val_loader : DataLoader for full-scan validation
     """
 
     def __init__(
@@ -120,39 +114,35 @@ class KRootDualTrainer:
         cfg,
         *,
         device: str | torch.device = "cpu",
+        joint_train_loader=None,
         short_train_loader=None,
         long_train_loader=None,
         val_loader=None,
     ):
-        self.cfg = cfg
-        self.device = torch.device(device)
+        super().__init__(cfg, device=device)
+        self.joint_train_loader = joint_train_loader
         self.short_train_loader = short_train_loader
         self.long_train_loader = long_train_loader
         self.val_loader = val_loader
-
-        self.hooks: list[Hook] = []
-        self.epoch = 0
-        self.global_step = 0
+        self._use_joint = joint_train_loader is not None
 
         # ── K-root params ────────────────────────────────────────────
-        self.k = int(_cfg_get(cfg, "kroot.k", 64))
-        self.s = int(_cfg_get(cfg, "kroot.s", 0))
-        if self.s <= 0:
-            self.s = int(round(math.sqrt(self.k)))
+        self.k = int(cfg_get(cfg, "kroot.k", 64))
+        self.s = resolve_kroot_stride(cfg, k=self.k)
 
         # ── Models ───────────────────────────────────────────────────
-        self.rotation_rep = str(_cfg_get(cfg, "model.pose_head.rotation_rep", "rot6d"))
+        self.rotation_rep = str(cfg_get(cfg, "model.pose_head.rotation_rep", "rot6d"))
         self.short_model = self._build_model("short").to(self.device)
         self.long_model = self._build_model("long").to(self.device)
 
         # ── Optimizers (separate for each model) ─────────────────────
-        lr = float(_cfg_get(cfg, "optimizer.lr_rec", _cfg_get(cfg, "optimizer.lr", 5e-4)))
-        weight_decay = float(_cfg_get(cfg, "optimizer.weight_decay", 1e-2))
-        betas = tuple(_cfg_get(cfg, "optimizer.betas", (0.9, 0.999)))
+        lr = float(cfg_get(cfg, "optimizer.lr_rec", cfg_get(cfg, "optimizer.lr", 5e-4)))
+        weight_decay = float(cfg_get(cfg, "optimizer.weight_decay", 1e-2))
+        betas = tuple(cfg_get(cfg, "optimizer.betas", (0.9, 0.999)))
         self.base_lr = lr
-        self.min_lr = float(_cfg_get(cfg, "optimizer.min_lr", 1e-6))
+        self.min_lr = float(cfg_get(cfg, "optimizer.min_lr", 1e-6))
 
-        encoder_lr_mult = float(_cfg_get(cfg, "optimizer.encoder_lr_mult", 0.1))
+        encoder_lr_mult = float(cfg_get(cfg, "optimizer.encoder_lr_mult", 0.1))
 
         def _make_optimizer(model: nn.Module) -> torch.optim.AdamW:
             encoder_params = [p for n, p in model.named_parameters()
@@ -170,59 +160,30 @@ class KRootDualTrainer:
         self.long_optimizer = _make_optimizer(self.long_model)
 
         # ── Loss config ──────────────────────────────────────────────
-        self.rot_weight = float(_cfg_get(cfg, "loss.rot_weight", 1.0))
-        self.trans_weight = float(_cfg_get(cfg, "loss.trans_weight", 1.0))
-        self.short_loss_weight = float(_cfg_get(cfg, "loss.short_weight", 1.0))
-        self.long_loss_weight = float(_cfg_get(cfg, "loss.long_weight", 1.0))
+        self.rot_weight = float(cfg_get(cfg, "loss.rot_weight", 1.0))
+        self.trans_weight = float(cfg_get(cfg, "loss.trans_weight", 1.0))
+        self.short_loss_weight = float(cfg_get(cfg, "loss.short_weight", 1.0))
+        self.long_loss_weight = float(cfg_get(cfg, "loss.long_weight", 1.0))
 
-        # ── Training schedule ────────────────────────────────────────
-        self.num_epochs = int(_cfg_get(cfg, "trainer.max_epochs", 1) or 1)
-        self.max_steps = _cfg_get(cfg, "train.max_steps") or _cfg_get(cfg, "trainer.max_steps")
-        if self.max_steps is not None:
-            self.max_steps = int(self.max_steps)
-        self.log_interval = int(_cfg_get(cfg, "trainer.log_interval", 50))
-        self.val_every = int(_cfg_get(cfg, "trainer.validate_every", 1) or 1)
-        self.save_path = str(_cfg_get(cfg, "paths.output_dir", "logs"))
-
-        # ── Gradient accumulation & clipping ─────────────────────────
-        self.grad_accum = max(1, int(_cfg_get(cfg, "trainer.grad_accum", 4) or 4))
-        self.max_grad_norm = float(_cfg_get(cfg, "trainer.max_grad_norm", 1.0))
-
-        # ── Warm-up ──────────────────────────────────────────────────
-        self.warmup_steps = int(_cfg_get(cfg, "optimizer.warmup_steps", 200))
+        # ── Override grad_accum default (KRootDual historically uses 4) ──
+        self.grad_accum = max(1, int(cfg_get(cfg, "trainer.grad_accum", 4) or 4))
 
         # ── EMA ──────────────────────────────────────────────────────
-        ema_decay = float(_cfg_get(cfg, "trainer.ema_decay", 0.999))
-        self.short_ema = _EMA(self.short_model, decay=ema_decay) if ema_decay > 0 else None
-        self.long_ema = _EMA(self.long_model, decay=ema_decay) if ema_decay > 0 else None
+        ema_decay = float(cfg_get(cfg, "trainer.ema_decay", 0.999))
+        self.short_ema = EMA(self.short_model, decay=ema_decay) if ema_decay > 0 else None
+        self.long_ema = EMA(self.long_model, decay=ema_decay) if ema_decay > 0 else None
 
         # ── Stitch config ────────────────────────────────────────────
-        self.enable_endpoint_interp = bool(_cfg_get(cfg, "stitch.enable_endpoint_interp", True))
-        self.stitch_short_overlap = int(_cfg_get(cfg, "stitch.short_overlap", 8))
+        self.enable_endpoint_interp = bool(cfg_get(cfg, "stitch.enable_endpoint_interp", True))
+        self.stitch_short_overlap = int(cfg_get(cfg, "stitch.short_overlap", 8))
         self.stitch_long_window_stride = int(
-            _cfg_get(cfg, "stitch.long_window_stride", max(1, self.k - 1))
+            cfg_get(cfg, "stitch.long_window_stride", max(1, self.k - 1))
         )
 
         # ── Calibration ─────────────────────────────────────────────
-        self.tform_calib: torch.Tensor | None = self._load_calib()
-
-    # ── Calibration ─────────────────────────────────────────────────
-
-    def _load_calib(self) -> torch.Tensor | None:
-        calib_file = _cfg_get(self.cfg, "dataset.calib_file")
-        if not calib_file:
-            return None
-        try:
-            from trainers.utils.calibration import load_calibration
-            resample_factor = float(_cfg_get(self.cfg, "dataset.resample_factor", 1.0))
-            _, _, tform_calib = load_calibration(calib_file, resample_factor, device=self.device)
-            if not isinstance(tform_calib, torch.Tensor):
-                import numpy as np
-                tform_calib = torch.as_tensor(np.array(tform_calib), dtype=torch.float32)
-            return tform_calib.float().to(self.device)
-        except Exception as exc:
-            warnings.warn(f"[KRootDual] Could not load calibration: {exc}")
-            return None
+        self.tform_calib: torch.Tensor | None = load_tform_calib(
+            cfg, device=self.device, warn_prefix="KRootDual",
+        )
 
     # ── Model construction ───────────────────────────────────────────
 
@@ -231,14 +192,14 @@ class KRootDualTrainer:
 
         Config lookup order:  model.<branch>.transformer.* → model.transformer.*
         """
-        backbone = str(_cfg_get(self.cfg, "model.encoder.backbone", "efficientnet_b0"))
-        pretrained = bool(_cfg_get(self.cfg, "model.encoder.pretrained", False))
+        backbone = str(cfg_get(self.cfg, "model.encoder.backbone", "efficientnet_b0"))
+        pretrained = bool(cfg_get(self.cfg, "model.encoder.pretrained", False))
 
         def _tf(key, default):
             # Try branch-specific first, then shared
-            v = _cfg_get(self.cfg, f"model.{branch}.transformer.{key}")
+            v = cfg_get(self.cfg, f"model.{branch}.transformer.{key}")
             if v is None:
-                v = _cfg_get(self.cfg, f"model.transformer.{key}", default)
+                v = cfg_get(self.cfg, f"model.transformer.{key}", default)
             return v
 
         token_dim = int(_tf("d_model", 256))
@@ -263,16 +224,7 @@ class KRootDualTrainer:
             memory_size=0,
         )
 
-    # ── Hooks ────────────────────────────────────────────────────────
-
-    def register_hook(self, hook: Hook) -> None:
-        self.hooks.append(hook)
-
-    def call_hooks(self, event: str, **kwargs) -> None:
-        for h in self.hooks:
-            fn = getattr(h, event, None)
-            if callable(fn):
-                fn(self, **kwargs)
+    # ── Hooks: inherited from BaseTrainer ─────────────────────────────
 
     # ── Checkpoint ───────────────────────────────────────────────────
 
@@ -341,14 +293,36 @@ class KRootDualTrainer:
         model: LongSeqPoseModel,
         batch: dict,
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        """Forward pass + chordal-rot + smooth-L1-trans loss for one branch."""
-        frames = batch["frames"].to(self.device)
-        gt_global = batch["gt_global_T"].to(self.device)
+        """Forward pass + chordal-rot + smooth-L1-trans loss for one branch.
 
+        Dtype promotion (uint8 → float32, /255) happens here on GPU via
+        non_blocking transfer to overlap CPU↔GPU copies with compute.
+        """
+        frames = batch["frames"].to(self.device, non_blocking=True)
+        gt_global = batch["gt_global_T"].to(self.device, non_blocking=True)
+
+        # Promote uint8 → float on GPU (avoids CPU .float().clone())
+        if frames.dtype != torch.float32:
+            frames = frames.float()
         if frames.max() > 1.1:
             frames = frames / 255.0
 
-        out = model(frames)
+        if "idx_long" in batch:
+            pos_ids = batch["idx_long"].to(self.device, non_blocking=True).long()
+        elif "frame_pos" in batch:
+            pos_ids = batch["frame_pos"].to(self.device, non_blocking=True).long()
+        else:
+            pos_ids = None
+
+        # V1 LongSeqPoseModel accepts (frames, memory, pos_offset).
+        # V2 V2LongSeqPoseModel accepts (frames, position_ids).
+        # Dispatch based on model signature.
+        import inspect as _inspect
+        sig = _inspect.signature(model.forward)
+        if "position_ids" in sig.parameters:
+            out = model(frames, position_ids=pos_ids)
+        else:
+            out = model(frames)
         pred_local_T = out["pred_local_T"]
 
         gt_local_T = local_from_global(gt_global)
@@ -373,216 +347,89 @@ class KRootDualTrainer:
         }
         return loss, metrics
 
-    # ── LR update ────────────────────────────────────────────────────
+    # ── BaseTrainer overrides ────────────────────────────────────────
 
-    def _update_lr(self) -> float:
-        total_steps = self._estimate_total_steps()
-        new_lr = _warmup_cosine_lr(
-            self.global_step, self.warmup_steps, total_steps,
-            self.base_lr, self.min_lr,
+    def _models_and_optimizers(self) -> Sequence[tuple[nn.Module, torch.optim.Optimizer]]:
+        return [
+            (self.short_model, self.short_optimizer),
+            (self.long_model, self.long_optimizer),
+        ]
+
+    def _get_train_loader(self):
+        """Return a single iterable that yields ``{"short": …, "long": …}``.
+
+        In joint mode: the joint loader already provides this format.
+        In legacy mode: wraps both loaders with :class:`_ZipCycleLoader`.
+        """
+        if self._use_joint:
+            return self.joint_train_loader
+        if self.short_train_loader is not None and self.long_train_loader is not None:
+            return _ZipCycleLoader(self.short_train_loader, self.long_train_loader)
+        return None
+
+    def _get_val_loader(self):
+        return self.val_loader
+
+    def _on_epoch_start(self, epoch: int) -> None:
+        active_loaders = (
+            [self.joint_train_loader] if self._use_joint
+            else [self.short_train_loader, self.long_train_loader]
         )
-        encoder_mult = float(_cfg_get(self.cfg, "optimizer.encoder_lr_mult", 0.1))
-        for opt in (self.short_optimizer, self.long_optimizer):
-            for pg in opt.param_groups:
-                if pg.get("name") == "encoder":
-                    pg["lr"] = new_lr * encoder_mult
-                else:
-                    pg["lr"] = new_lr
-        return new_lr
+        for loader in active_loaders:
+            if loader is None:
+                continue
+            ds = getattr(loader, "dataset", None)
+            if hasattr(ds, "set_epoch"):
+                ds.set_epoch(epoch)
 
-    def _estimate_total_steps(self) -> int:
-        if self.max_steps is not None:
-            return self.max_steps
-        try:
-            loader_len = len(self.short_train_loader)
-        except TypeError:
-            loader_len = 100
-        steps_per_epoch = max(1, loader_len // self.grad_accum)
-        return steps_per_epoch * self.num_epochs
+    def _run_step(self, batch: dict) -> tuple[torch.Tensor, dict[str, float]]:
+        """Forward + loss on both branches for a single micro-batch.
 
-    # ── Train loop ───────────────────────────────────────────────────
+        ``batch`` is ``{"short": …, "long": …}`` regardless of loader mode.
+        Returns ``(total_loss, combined_metrics)`` where *total_loss* is
+        ``short_weight * short_loss + long_weight * long_loss``.
+        """
+        short_batch = batch["short"]
+        long_batch = batch["long"]
 
-    def train(self):
-        if self.short_train_loader is None or self.long_train_loader is None:
-            raise ValueError("Both short_train_loader and long_train_loader are required")
+        short_loss, sm = self._forward_branch(self.short_model, short_batch)
+        long_loss, lm = self._forward_branch(self.long_model, long_batch)
 
-        self.call_hooks("before_run", mode="train")
-        self.call_hooks("before_train")
+        total_loss = self.short_loss_weight * short_loss + self.long_loss_weight * long_loss
 
-        start_epoch = self.epoch
-        for epoch in range(start_epoch, self.num_epochs):
-            self.epoch = epoch
-            self.short_model.train()
-            self.long_model.train()
-            epoch_short_loss = 0.0
-            epoch_long_loss = 0.0
-            n_optim_steps = 0
-            n_micro_steps = 0
+        metrics = {
+            "short_loss": float(short_loss.item()),
+            "long_loss": float(long_loss.item()),
+            "short_rot": sm["rot_loss"],
+            "short_trans": sm["trans_loss"],
+            "short_drift_mm": sm["drift_mm"],
+            "long_rot": lm["rot_loss"],
+            "long_trans": lm["trans_loss"],
+            "long_drift_mm": lm["drift_mm"],
+        }
+        return total_loss, metrics
 
-            self.call_hooks("before_epoch")
+    def _after_optim_step(self) -> None:
+        if self.short_ema is not None:
+            self.short_ema.update(self.short_model)
+        if self.long_ema is not None:
+            self.long_ema.update(self.long_model)
 
-            # Set epoch for both datasets
-            for loader in (self.short_train_loader, self.long_train_loader):
-                ds = getattr(loader, "dataset", None)
-                if hasattr(ds, "set_epoch"):
-                    ds.set_epoch(epoch)
-
-            self.short_optimizer.zero_grad()
-            self.long_optimizer.zero_grad()
-
-            short_iter = iter(self.short_train_loader)
-            long_iter = iter(self.long_train_loader)
-
-            accum_short = 0.0
-            accum_long = 0.0
-            step_done = False
-
-            while not step_done:
-                if self.max_steps is not None and self.global_step >= self.max_steps:
-                    break
-
-                # ── Get batches ──────────────────────────────────────
-                try:
-                    short_batch = next(short_iter)
-                except StopIteration:
-                    break
-                try:
-                    long_batch = next(long_iter)
-                except StopIteration:
-                    # Long loader exhausted before short — restart it
-                    long_iter = iter(self.long_train_loader)
-                    try:
-                        long_batch = next(long_iter)
-                    except StopIteration:
-                        break
-
-                n_micro_steps += 1
-                self.call_hooks("before_step")
-
-                # ── Short forward + backward ─────────────────────────
-                short_loss, short_metrics = self._forward_branch(self.short_model, short_batch)
-                (self.short_loss_weight * short_loss / self.grad_accum).backward()
-                accum_short += float(short_loss.item())
-
-                # ── Long forward + backward ──────────────────────────
-                long_loss, long_metrics = self._forward_branch(self.long_model, long_batch)
-                (self.long_loss_weight * long_loss / self.grad_accum).backward()
-                accum_long += float(long_loss.item())
-
-                # ── Optimizer step every grad_accum micro-steps ──────
-                if n_micro_steps % self.grad_accum == 0:
-                    for model, opt in [
-                        (self.short_model, self.short_optimizer),
-                        (self.long_model, self.long_optimizer),
-                    ]:
-                        torch.nn.utils.clip_grad_norm_(
-                            model.parameters(), max_norm=self.max_grad_norm
-                        )
-                        opt.step()
-                        opt.zero_grad()
-
-                    self.global_step += 1
-                    n_optim_steps += 1
-                    current_lr = self._update_lr()
-
-                    # EMA update
-                    if self.short_ema is not None:
-                        self.short_ema.update(self.short_model)
-                    if self.long_ema is not None:
-                        self.long_ema.update(self.long_model)
-
-                    avg_s = accum_short / self.grad_accum
-                    avg_l = accum_long / self.grad_accum
-                    epoch_short_loss += avg_s
-                    epoch_long_loss += avg_l
-                    accum_short = accum_long = 0.0
-
-                    if n_optim_steps % self.log_interval == 0 or n_optim_steps == 1:
-                        print(
-                            f"[KRootDual epoch {epoch}  step {n_optim_steps}]  "
-                            f"short={avg_s:.4f}(rot={short_metrics['rot_loss']:.4f} "
-                            f"trans={short_metrics['trans_loss']:.4f} "
-                            f"drift={short_metrics['drift_mm']:.1f}mm)  "
-                            f"long={avg_l:.4f}(rot={long_metrics['rot_loss']:.4f} "
-                            f"trans={long_metrics['trans_loss']:.4f} "
-                            f"drift={long_metrics['drift_mm']:.1f}mm)  "
-                            f"lr={current_lr:.2e}"
-                        )
-
-                    self.call_hooks(
-                        "after_step",
-                        log_buffer={
-                            "mode": "train",
-                            "epoch": epoch + 1,
-                            "iter": n_optim_steps,
-                            "global_step": self.global_step,
-                            "loss": avg_s + avg_l,
-                            "short_loss": avg_s,
-                            "long_loss": avg_l,
-                            "short_rot": short_metrics["rot_loss"],
-                            "short_trans": short_metrics["trans_loss"],
-                            "short_drift_mm": short_metrics["drift_mm"],
-                            "long_rot": long_metrics["rot_loss"],
-                            "long_trans": long_metrics["trans_loss"],
-                            "long_drift_mm": long_metrics["drift_mm"],
-                            "lr": current_lr,
-                        },
-                    )
-
-            # Handle remaining accumulated gradients
-            if n_micro_steps % self.grad_accum != 0:
-                rem = n_micro_steps % self.grad_accum
-                for model, opt in [
-                    (self.short_model, self.short_optimizer),
-                    (self.long_model, self.long_optimizer),
-                ]:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=self.max_grad_norm)
-                    opt.step()
-                    opt.zero_grad()
-                self.global_step += 1
-                n_optim_steps += 1
-                if self.short_ema is not None:
-                    self.short_ema.update(self.short_model)
-                if self.long_ema is not None:
-                    self.long_ema.update(self.long_model)
-                epoch_short_loss += accum_short / rem
-                epoch_long_loss += accum_long / rem
-
-            avg_s = epoch_short_loss / max(1, n_optim_steps)
-            avg_l = epoch_long_loss / max(1, n_optim_steps)
-            print(
-                f"[KRootDual epoch {epoch}] avg short={avg_s:.4f}  avg long={avg_l:.4f}  "
-                f"optim_steps={n_optim_steps}"
-            )
-            _lr = float(self.short_optimizer.param_groups[-1]["lr"])
-            self.call_hooks(
-                "after_epoch",
-                log_buffer={
-                    "epoch": epoch + 1,
-                    "train_loss": avg_s + avg_l,
-                    "short_loss": avg_s,
-                    "long_loss": avg_l,
-                    "lr": _lr,
-                },
-            )
-
-            # ── Validation ───────────────────────────────────────────
-            if self.val_loader is not None and (epoch + 1) % self.val_every == 0:
-                self.call_hooks("before_val")
-                val_metrics = self.evaluate(self.val_loader)
-                self.last_eval_metrics = val_metrics
-                print(f"[KRootDual val epoch {epoch}] {val_metrics}")
-                self.call_hooks(
-                    "after_val",
-                    log_buffer={
-                        "epoch": epoch + 1,
-                        "val_loss": val_metrics.get("mean_gpe_mm_fused", 0.0),
-                        **val_metrics,
-                    },
-                )
-
-        self.call_hooks("after_train")
-        self.call_hooks("after_run")
+    def _format_step_log(
+        self, epoch: int, n_optim_steps: int, avg_accum: float,
+        metrics: dict[str, float], current_lr: float,
+    ) -> str:
+        m = metrics
+        return (
+            f"[KRootDual epoch {epoch}  step {n_optim_steps}]  "
+            f"short={m.get('short_loss', 0):.4f}(rot={m.get('short_rot', 0):.4f} "
+            f"trans={m.get('short_trans', 0):.4f} "
+            f"drift={m.get('short_drift_mm', 0):.1f}mm)  "
+            f"long={m.get('long_loss', 0):.4f}(rot={m.get('long_rot', 0):.4f} "
+            f"trans={m.get('long_trans', 0):.4f} "
+            f"drift={m.get('long_drift_mm', 0):.1f}mm)  "
+            f"lr={current_lr:.2e}"
+        )
 
     # ── Evaluation with stitch fusion ────────────────────────────────
 
@@ -663,9 +510,9 @@ class KRootDualTrainer:
 
         # Restore original (non-EMA) weights
         if short_backup is not None:
-            _EMA.restore(self.short_model, short_backup)
+            EMA.restore(self.short_model, short_backup)
         if long_backup is not None:
-            _EMA.restore(self.long_model, long_backup)
+            EMA.restore(self.long_model, long_backup)
 
         if not all_metrics:
             return {"mean_gpe_mm_fused": 0.0}

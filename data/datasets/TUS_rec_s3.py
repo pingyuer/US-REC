@@ -198,7 +198,15 @@ class TUSRecS3Iterable(torch.utils.data.IterableDataset):
                 ) from last_exc
             raise last_exc  # type: ignore[misc]  # train path: caught below
 
-        if self.prefetch_slices <= 0:
+        # ── Guard: disable internal threadpool when DataLoader uses workers ──
+        # Having both num_workers>0 AND prefetch_slices>0 causes double
+        # concurrency that hurts throughput rather than helping.
+        effective_prefetch = self.prefetch_slices
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is not None and worker_info.num_workers > 0:
+            effective_prefetch = 0
+
+        if effective_prefetch <= 0:
             for info in slice_infos:
                 try:
                     frames_t, tforms_t = _load(info)
@@ -209,10 +217,10 @@ class TUSRecS3Iterable(torch.utils.data.IterableDataset):
                 yield info, frames_t, tforms_t
             return
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.prefetch_slices) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=effective_prefetch) as executor:
             info_iter = iter(slice_infos)
             futures: dict = {}
-            for _ in range(self.prefetch_slices):
+            for _ in range(effective_prefetch):
                 info = next(info_iter, None)
                 if info is None:
                     break

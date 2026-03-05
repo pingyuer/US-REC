@@ -198,6 +198,94 @@ def resolve_run_dirs(cfg: Any, ctx: TrainingContext) -> dict[str, Path]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Shared DataLoader factory — applies persistent_workers, prefetch_factor,
+# pin_memory, etc. in one place.
+# ---------------------------------------------------------------------------
+
+def _make_dataloader(
+    dataset: Any,
+    dl_cfg: dict,
+    *,
+    is_train: bool = True,
+) -> Any:
+    """Create a ``DataLoader`` with PyTorch-recommended throughput settings.
+
+    Parameters
+    ----------
+    dataset : IterableDataset
+    dl_cfg : dict
+        Per-split dataloader config from yaml (batch_size, num_workers, …).
+    is_train : bool
+        If True, add ``persistent_workers`` and ``prefetch_factor`` for
+        maximum overlap between CPU loading and GPU compute.
+    """
+    from torch.utils.data import DataLoader  # noqa: PLC0415
+
+    batch_size = int(dl_cfg.get("batch_size", 1))
+    num_workers = int(dl_cfg.get("num_workers", 0))
+    pin_memory = bool(dl_cfg.get("pin_memory", True))
+
+    # prefetch_factor: configurable, default 4 (PyTorch default is 2)
+    prefetch_factor = int(dl_cfg.get("prefetch_factor", 4))
+    # persistent_workers: keep workers alive between epochs (saves fork cost)
+    persistent_workers = bool(dl_cfg.get("persistent_workers", True)) and num_workers > 0
+
+    kwargs: dict = {
+        "batch_size": batch_size,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+    }
+    if num_workers > 0:
+        kwargs["persistent_workers"] = persistent_workers
+        kwargs["prefetch_factor"] = prefetch_factor
+
+    return DataLoader(dataset, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Shared calibration + image-size extraction for builder functions.
+# ---------------------------------------------------------------------------
+
+def _load_builder_calib(
+    cfg: Any,
+    ds_cfg: dict,
+) -> tuple[Any, "tuple[int, int] | None"]:
+    """Load ``tform_calib`` (as CPU tensor) and ``image_size`` from config.
+
+    Returns ``(tform_calib_or_None, image_size_or_None)``.
+    Centralises the 4× duplicated calibration blocks that used to appear
+    in ``_build_scan_window_loaders``, ``_build_kroot_loaders``,
+    ``_build_kroot_dual_loaders``, and ``_build_kroot_dual_joint_loaders``.
+    """
+    tform_calib = None
+    calib_file = ds_cfg.get("calib_file") or OmegaConf.select(cfg, "dataset.calib_file")
+    if calib_file:
+        try:
+            from trainers.utils.calibration import load_calibration  # noqa: PLC0415
+
+            resample_factor = float(ds_cfg.get("resample_factor", 1.0))
+            _, _, tform_calib = load_calibration(calib_file, resample_factor, device="cpu")
+            if not isinstance(tform_calib, torch.Tensor):
+                import numpy as np  # noqa: PLC0415
+
+                tform_calib = torch.as_tensor(np.array(tform_calib), dtype=torch.float32)
+            tform_calib = tform_calib.float()
+        except Exception as exc:
+            import warnings
+
+            warnings.warn(f"[builder] Could not load calibration from {calib_file!r}: {exc}")
+            tform_calib = None
+
+    image_size: tuple[int, int] | None = None
+    cfg_img_h = OmegaConf.select(cfg, "dataset.image_size_h") or OmegaConf.select(cfg, "model.image_size_h")
+    cfg_img_w = OmegaConf.select(cfg, "dataset.image_size_w") or OmegaConf.select(cfg, "model.image_size_w")
+    if cfg_img_h and cfg_img_w:
+        image_size = (int(cfg_img_h), int(cfg_img_w))
+
+    return tform_calib, image_size
+
+
 def _build_scan_window_loaders(
     cfg: Any,
     dset_train: Any,
@@ -228,31 +316,8 @@ def _build_scan_window_loaders(
     train_dl_cfg = OmegaConf.to_container(dl_cfg.get("train") or {}, resolve=True) if dl_cfg else {}
     val_dl_cfg = OmegaConf.to_container(dl_cfg.get("val") or {}, resolve=True) if dl_cfg else {}
 
-    # ── Optional calibration ────────────────────────────────────────────────
-    # Load tform_calib so the dataset can expose it per-sample for DDF loss /
-    # official TUS-REC metric computation in the trainer's evaluate().
-    tform_calib = None
-    image_size: tuple[int, int] | None = None
-    calib_file = ds_cfg.get("calib_file") or OmegaConf.select(cfg, "dataset.calib_file")
-    if calib_file:
-        try:
-            from trainers.utils.calibration import load_calibration  # noqa: PLC0415
-            resample_factor = float(ds_cfg.get("resample_factor", 1.0))
-            _, _, tform_calib = load_calibration(calib_file, resample_factor, device="cpu")
-            # tform_calib is returned as a torch.Tensor (4,4) or numpy; ensure tensor
-            if not isinstance(tform_calib, torch.Tensor):
-                import numpy as np  # noqa: PLC0415
-                tform_calib = torch.as_tensor(np.array(tform_calib), dtype=torch.float32)
-            tform_calib = tform_calib.float()
-        except Exception as exc:
-            import warnings
-            warnings.warn(f"[builder] Could not load calibration from {calib_file!r}: {exc}")
-            tform_calib = None
-    # Image size from config (H, W)
-    cfg_img_h = OmegaConf.select(cfg, "dataset.image_size_h") or OmegaConf.select(cfg, "model.image_size_h")
-    cfg_img_w = OmegaConf.select(cfg, "dataset.image_size_w") or OmegaConf.select(cfg, "model.image_size_w")
-    if cfg_img_h and cfg_img_w:
-        image_size = (int(cfg_img_h), int(cfg_img_w))
+    # ── Optional calibration + image size ─────────────────────────────────
+    tform_calib, image_size = _load_builder_calib(cfg, ds_cfg)
 
     train_loader = val_loader = None
     if dset_train is not None:
@@ -271,12 +336,7 @@ def _build_scan_window_loaders(
             calib_matrix=tform_calib,
             image_size=image_size,
         )
-        train_loader = DataLoader(
-            sw_train,
-            batch_size=int(train_dl_cfg.get("batch_size", 1)),
-            num_workers=int(train_dl_cfg.get("num_workers", 0)),
-            pin_memory=bool(train_dl_cfg.get("pin_memory", False)),
-        )
+        train_loader = _make_dataloader(sw_train, train_dl_cfg, is_train=True)
     if dset_val is not None:
         sw_val = ScanWindowDataset(
             base_dataset=dset_val,
@@ -287,12 +347,7 @@ def _build_scan_window_loaders(
             calib_matrix=tform_calib,
             image_size=image_size,
         )
-        val_loader = DataLoader(
-            sw_val,
-            batch_size=int(val_dl_cfg.get("batch_size", 1)),
-            num_workers=int(val_dl_cfg.get("num_workers", 0)),
-            pin_memory=bool(val_dl_cfg.get("pin_memory", False)),
-        )
+        val_loader = _make_dataloader(sw_val, val_dl_cfg, is_train=False)
     return train_loader, val_loader
 
 
@@ -325,27 +380,8 @@ def _build_kroot_loaders(
     train_dl_cfg = OmegaConf.to_container(dl_cfg.get("train") or {}, resolve=True) if dl_cfg else {}
     val_dl_cfg = OmegaConf.to_container(dl_cfg.get("val") or {}, resolve=True) if dl_cfg else {}
 
-    # Optional calibration
-    tform_calib = None
-    image_size: tuple[int, int] | None = None
-    calib_file = ds_cfg.get("calib_file") or OmegaConf.select(cfg, "dataset.calib_file")
-    if calib_file:
-        try:
-            from trainers.utils.calibration import load_calibration  # noqa: PLC0415
-            resample_factor = float(ds_cfg.get("resample_factor", 1.0))
-            _, _, tform_calib = load_calibration(calib_file, resample_factor, device="cpu")
-            if not isinstance(tform_calib, torch.Tensor):
-                import numpy as np  # noqa: PLC0415
-                tform_calib = torch.as_tensor(np.array(tform_calib), dtype=torch.float32)
-            tform_calib = tform_calib.float()
-        except Exception as exc:
-            import warnings
-            warnings.warn(f"[builder] Could not load calibration from {calib_file!r}: {exc}")
-            tform_calib = None
-    cfg_img_h = OmegaConf.select(cfg, "dataset.image_size_h") or OmegaConf.select(cfg, "model.image_size_h")
-    cfg_img_w = OmegaConf.select(cfg, "dataset.image_size_w") or OmegaConf.select(cfg, "model.image_size_w")
-    if cfg_img_h and cfg_img_w:
-        image_size = (int(cfg_img_h), int(cfg_img_w))
+    # Optional calibration + image size
+    tform_calib, image_size = _load_builder_calib(cfg, ds_cfg)
 
     train_loader = val_loader = None
 
@@ -358,23 +394,13 @@ def _build_kroot_loaders(
                 mode="train", seed=seed, augment_flip=augment_flip,
                 flip_prob=flip_prob, calib_matrix=tform_calib, image_size=image_size,
             )
-            train_loader = DataLoader(
-                sw_train,
-                batch_size=int(train_dl_cfg.get("batch_size", 1)),
-                num_workers=int(train_dl_cfg.get("num_workers", 0)),
-                pin_memory=bool(train_dl_cfg.get("pin_memory", False)),
-            )
+            train_loader = _make_dataloader(sw_train, train_dl_cfg, is_train=True)
         if dset_val is not None:
             sw_val = ShortWindowDataset(
                 base_dataset=dset_val, k=k, overlap=overlap,
                 mode="val", seed=seed, calib_matrix=tform_calib, image_size=image_size,
             )
-            val_loader = DataLoader(
-                sw_val,
-                batch_size=int(val_dl_cfg.get("batch_size", 1)),
-                num_workers=int(val_dl_cfg.get("num_workers", 0)),
-                pin_memory=bool(val_dl_cfg.get("pin_memory", False)),
-            )
+            val_loader = _make_dataloader(sw_val, val_dl_cfg, is_train=False)
     elif seq_mode == "kroot_long":
         from data.datasets.dual_kroot_window import LongWindowDataset  # noqa: PLC0415
         overlap_tokens = int(ds_cfg.get("long_overlap_tokens", 0))
@@ -384,23 +410,13 @@ def _build_kroot_loaders(
                 mode="train", seed=seed, augment_flip=augment_flip,
                 flip_prob=flip_prob, calib_matrix=tform_calib, image_size=image_size,
             )
-            train_loader = DataLoader(
-                sw_train,
-                batch_size=int(train_dl_cfg.get("batch_size", 1)),
-                num_workers=int(train_dl_cfg.get("num_workers", 0)),
-                pin_memory=bool(train_dl_cfg.get("pin_memory", False)),
-            )
+            train_loader = _make_dataloader(sw_train, train_dl_cfg, is_train=True)
         if dset_val is not None:
             sw_val = LongWindowDataset(
                 base_dataset=dset_val, k=k, s=s, overlap_tokens=overlap_tokens,
                 mode="val", seed=seed, calib_matrix=tform_calib, image_size=image_size,
             )
-            val_loader = DataLoader(
-                sw_val,
-                batch_size=int(val_dl_cfg.get("batch_size", 1)),
-                num_workers=int(val_dl_cfg.get("num_workers", 0)),
-                pin_memory=bool(val_dl_cfg.get("pin_memory", False)),
-            )
+            val_loader = _make_dataloader(sw_val, val_dl_cfg, is_train=False)
     else:
         raise ValueError(f"Unknown kroot sequence_mode: {seq_mode!r}")
 
@@ -416,6 +432,9 @@ def _build_kroot_dual_loaders(
 
     Returns (short_train_loader, long_train_loader, val_loader).
     The val_loader wraps ShortWindowDataset in val mode (yields full scans).
+
+    .. deprecated:: Use ``_build_kroot_dual_joint_loaders`` for the single-
+       loader path (sequence_mode=kroot_dual_joint).
     """
     from torch.utils.data import DataLoader  # noqa: PLC0415
     from data.datasets.dual_kroot_window import ShortWindowDataset, LongWindowDataset  # noqa: PLC0415
@@ -440,27 +459,8 @@ def _build_kroot_dual_loaders(
     train_dl_cfg = OmegaConf.to_container(dl_cfg.get("train") or {}, resolve=True) if dl_cfg else {}
     val_dl_cfg = OmegaConf.to_container(dl_cfg.get("val") or {}, resolve=True) if dl_cfg else {}
 
-    # Calibration
-    tform_calib = None
-    image_size: tuple[int, int] | None = None
-    calib_file = ds_cfg.get("calib_file") or OmegaConf.select(cfg, "dataset.calib_file")
-    if calib_file:
-        try:
-            from trainers.utils.calibration import load_calibration  # noqa: PLC0415
-            resample_factor = float(ds_cfg.get("resample_factor", 1.0))
-            _, _, tform_calib = load_calibration(calib_file, resample_factor, device="cpu")
-            if not isinstance(tform_calib, torch.Tensor):
-                import numpy as np  # noqa: PLC0415
-                tform_calib = torch.as_tensor(np.array(tform_calib), dtype=torch.float32)
-            tform_calib = tform_calib.float()
-        except Exception as exc:
-            import warnings
-            warnings.warn(f"[builder] Could not load calibration: {exc}")
-            tform_calib = None
-    cfg_img_h = OmegaConf.select(cfg, "dataset.image_size_h") or OmegaConf.select(cfg, "model.image_size_h")
-    cfg_img_w = OmegaConf.select(cfg, "dataset.image_size_w") or OmegaConf.select(cfg, "model.image_size_w")
-    if cfg_img_h and cfg_img_w:
-        image_size = (int(cfg_img_h), int(cfg_img_w))
+    # Calibration + image size
+    tform_calib, image_size = _load_builder_calib(cfg, ds_cfg)
 
     short_overlap = int(ds_cfg.get("short_overlap", 8))
     long_overlap_tokens = int(ds_cfg.get("long_overlap_tokens", 0))
@@ -474,24 +474,14 @@ def _build_kroot_dual_loaders(
             mode="train", seed=seed, augment_flip=augment_flip,
             flip_prob=flip_prob, calib_matrix=tform_calib, image_size=image_size,
         )
-        short_train_loader = DataLoader(
-            sw_short,
-            batch_size=int(train_dl_cfg.get("batch_size", 1)),
-            num_workers=int(train_dl_cfg.get("num_workers", 0)),
-            pin_memory=bool(train_dl_cfg.get("pin_memory", False)),
-        )
+        short_train_loader = _make_dataloader(sw_short, train_dl_cfg, is_train=True)
         # Long train loader
         sw_long = LongWindowDataset(
             base_dataset=dset_train, k=k, s=s, overlap_tokens=long_overlap_tokens,
             mode="train", seed=seed, augment_flip=augment_flip,
             flip_prob=flip_prob, calib_matrix=tform_calib, image_size=image_size,
         )
-        long_train_loader = DataLoader(
-            sw_long,
-            batch_size=int(train_dl_cfg.get("batch_size", 1)),
-            num_workers=int(train_dl_cfg.get("num_workers", 0)),
-            pin_memory=bool(train_dl_cfg.get("pin_memory", False)),
-        )
+        long_train_loader = _make_dataloader(sw_long, train_dl_cfg, is_train=True)
 
     if dset_val is not None:
         # Val loader: full-scan mode via ShortWindowDataset (yields entire scan)
@@ -499,14 +489,160 @@ def _build_kroot_dual_loaders(
             base_dataset=dset_val, k=k, overlap=short_overlap,
             mode="val", seed=seed, calib_matrix=tform_calib, image_size=image_size,
         )
-        val_loader = DataLoader(
-            sw_val,
-            batch_size=int(val_dl_cfg.get("batch_size", 1)),
-            num_workers=int(val_dl_cfg.get("num_workers", 0)),
-            pin_memory=bool(val_dl_cfg.get("pin_memory", False)),
-        )
+        val_loader = _make_dataloader(sw_val, val_dl_cfg, is_train=False)
 
     return short_train_loader, long_train_loader, val_loader
+
+
+def _build_kroot_dual_joint_loaders(
+    cfg: Any,
+    dset_train: Any,
+    dset_val: Any,
+) -> tuple[Any, Any]:
+    """Build a *single* joint train loader + val loader for KRootDualTrainer.
+
+    Returns ``(joint_train_loader, val_loader)``.
+    The joint loader yields ``{"short": …, "long": …, "meta": …}`` per batch.
+    """
+    from torch.utils.data import DataLoader  # noqa: PLC0415
+    from data.datasets.kroot_dual_joint import JointKRootDualDataset  # noqa: PLC0415
+    from data.datasets.dual_kroot_window import ShortWindowDataset  # noqa: PLC0415
+    import math as _math  # noqa: PLC0415
+
+    ds_cfg = OmegaConf.select(cfg, "dataset") or {}
+    kroot_cfg = OmegaConf.select(cfg, "kroot") or {}
+    k = int(kroot_cfg.get("k", ds_cfg.get("sequence_window", 64)))
+    s_raw = kroot_cfg.get("s", ds_cfg.get("long_stride", 0))
+    s = int(s_raw) if s_raw and int(s_raw) > 0 else int(round(_math.sqrt(k)))
+    seed = int(OmegaConf.select(cfg, "seed") or 0)
+
+    # Augmentation
+    augment_flip = bool(ds_cfg.get("augment_flip", False))
+    flip_prob = float(ds_cfg.get("flip_prob", 0.5))
+    _reverse_prob = OmegaConf.select(cfg, "dataset.augment.reverse_prob")
+    if _reverse_prob is not None:
+        augment_flip = True
+        flip_prob = float(_reverse_prob)
+
+    dl_cfg = OmegaConf.select(cfg, "dataloader") or {}
+    train_dl_cfg = OmegaConf.to_container(dl_cfg.get("train") or {}, resolve=True) if dl_cfg else {}
+    val_dl_cfg = OmegaConf.to_container(dl_cfg.get("val") or {}, resolve=True) if dl_cfg else {}
+
+    # Calibration + image size
+    tform_calib, image_size = _load_builder_calib(cfg, ds_cfg)
+
+    short_overlap = int(ds_cfg.get("short_overlap", 8))
+    long_overlap_tokens = int(ds_cfg.get("long_overlap_tokens", 0))
+
+    joint_train_loader = val_loader = None
+
+    if dset_train is not None:
+        joint_ds = JointKRootDualDataset(
+            base_dataset=dset_train,
+            k=k, s=s,
+            short_overlap=short_overlap,
+            long_overlap_tokens=long_overlap_tokens,
+            mode="train", seed=seed,
+            augment_flip=augment_flip,
+            flip_prob=flip_prob,
+            calib_matrix=tform_calib,
+            image_size=image_size,
+        )
+        joint_train_loader = _make_dataloader(joint_ds, train_dl_cfg, is_train=True)
+
+    if dset_val is not None:
+        sw_val = ShortWindowDataset(
+            base_dataset=dset_val, k=k, overlap=short_overlap,
+            mode="val", seed=seed, calib_matrix=tform_calib, image_size=image_size,
+        )
+        val_loader = _make_dataloader(sw_val, val_dl_cfg, is_train=False)
+
+    return joint_train_loader, val_loader
+
+
+# ---------------------------------------------------------------------------
+# V2 joint loader builder (scientific stride + position_ids)
+# ---------------------------------------------------------------------------
+
+def _build_kroot_dual_v2_joint_loaders(
+    cfg: Any,
+    dset_train: Any,
+    dset_val: Any,
+) -> tuple[Any, Any]:
+    """Build V2 joint train loader + val loader with scientific stride.
+
+    Returns ``(joint_train_loader, val_loader)``.
+    The V2 joint loader yields ``{"short": …, "long": …, "meta": …}``
+    with ``position_ids`` in each branch for the V2 PE system.
+    """
+    from torch.utils.data import DataLoader  # noqa: PLC0415
+    from data.datasets.kroot_dual_joint_v2 import V2JointKRootDualDataset  # noqa: PLC0415
+    from data.datasets.dual_kroot_window import ShortWindowDataset  # noqa: PLC0415
+    import math as _math  # noqa: PLC0415
+
+    ds_cfg = OmegaConf.select(cfg, "dataset") or {}
+    kroot_cfg = OmegaConf.select(cfg, "kroot") or {}
+    k = int(kroot_cfg.get("k", ds_cfg.get("sequence_window", 64)))
+
+    # V2: compute s from L_target_frames
+    L_target = kroot_cfg.get("L_target_frames")
+    s_raw = kroot_cfg.get("s", ds_cfg.get("long_stride", 0))
+    if L_target is not None and int(L_target) > 0 and k > 1:
+        s = max(1, _math.ceil(int(L_target) / (k - 1)))
+    elif s_raw and int(s_raw) > 0:
+        s = int(s_raw)
+    else:
+        s = int(round(_math.sqrt(k)))
+
+    seed = int(OmegaConf.select(cfg, "seed") or 0)
+
+    # Augmentation
+    augment_flip = bool(ds_cfg.get("augment_flip", False))
+    flip_prob = float(ds_cfg.get("flip_prob", 0.5))
+    _reverse_prob = OmegaConf.select(cfg, "dataset.augment.reverse_prob")
+    if _reverse_prob is not None:
+        augment_flip = True
+        flip_prob = float(_reverse_prob)
+
+    dl_cfg = OmegaConf.select(cfg, "dataloader") or {}
+    train_dl_cfg = OmegaConf.to_container(dl_cfg.get("train") or {}, resolve=True) if dl_cfg else {}
+    val_dl_cfg = OmegaConf.to_container(dl_cfg.get("val") or {}, resolve=True) if dl_cfg else {}
+
+    # Calibration + image size
+    tform_calib, image_size = _load_builder_calib(cfg, ds_cfg)
+
+    short_overlap = int(ds_cfg.get("short_overlap", 8))
+    long_overlap_tokens = int(ds_cfg.get("long_overlap_tokens", 0))
+    scan_adaptive = bool(kroot_cfg.get("scan_adaptive", True))
+
+    joint_train_loader = val_loader = None
+
+    if dset_train is not None:
+        joint_ds = V2JointKRootDualDataset(
+            base_dataset=dset_train,
+            k=k,
+            L_target_frames=int(L_target) if L_target is not None else None,
+            s=s,
+            scan_adaptive=scan_adaptive,
+            short_overlap=short_overlap,
+            long_overlap_tokens=long_overlap_tokens,
+            mode="train",
+            seed=seed,
+            augment_flip=augment_flip,
+            flip_prob=flip_prob,
+            calib_matrix=tform_calib,
+            image_size=image_size,
+        )
+        joint_train_loader = _make_dataloader(joint_ds, train_dl_cfg, is_train=True)
+
+    if dset_val is not None:
+        sw_val = ShortWindowDataset(
+            base_dataset=dset_val, k=k, overlap=short_overlap,
+            mode="val", seed=seed, calib_matrix=tform_calib, image_size=image_size,
+        )
+        val_loader = _make_dataloader(sw_val, val_dl_cfg, is_train=False)
+
+    return joint_train_loader, val_loader
 
 
 def build_rec_trainer(
@@ -536,7 +672,23 @@ def build_rec_trainer(
     if uses_loaders:
         # Dispatch to the correct loader builder based on sequence_mode.
         seq_mode = str(OmegaConf.select(cfg, "dataset.sequence_mode") or "scan_window").lower()
-        if seq_mode == "kroot_dual":
+        if seq_mode == "kroot_dual_v2":
+            joint_tl, val_loader = _build_kroot_dual_v2_joint_loaders(cfg, dset_train, dset_val)
+            params = {
+                "cfg": cfg,
+                "device": device,
+                "joint_train_loader": joint_tl,
+                "val_loader": val_loader,
+            }
+        elif seq_mode == "kroot_dual_joint":
+            joint_tl, val_loader = _build_kroot_dual_joint_loaders(cfg, dset_train, dset_val)
+            params = {
+                "cfg": cfg,
+                "device": device,
+                "joint_train_loader": joint_tl,
+                "val_loader": val_loader,
+            }
+        elif seq_mode == "kroot_dual":
             short_tl, long_tl, val_loader = _build_kroot_dual_loaders(cfg, dset_train, dset_val)
             params = {
                 "cfg": cfg,

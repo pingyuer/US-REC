@@ -30,7 +30,7 @@ from typing import Sequence
 import torch
 import torch.nn.functional as F
 
-from utils.rotation_loss import geodesic_loss
+from models.losses.pose_loss import se3_geodesic_loss as _se3_pose_loss  # consolidated
 
 
 # ─── Reference point helpers ─────────────────────────────────────────────────
@@ -117,52 +117,8 @@ def _points_loss_from_transforms(
     return F.mse_loss(pred_pos, gt_pos)
 
 
-# ─── SE(3) parameter loss (ablation only) ────────────────────────────────────
-
-def _se3_pose_loss(
-    pred_T: torch.Tensor,
-    gt_T: torch.Tensor,
-    mask: torch.Tensor | None = None,
-    rot_weight: float = 1.0,
-    trans_weight: float = 1.0,
-) -> tuple[torch.Tensor, dict[str, float]]:
-    """Geodesic rotation + L2 translation loss (ablation / legacy mode).
-
-    Parameters
-    ----------
-    pred_T, gt_T : (B, T, 4, 4) or (N, 4, 4)
-    mask : optional boolean tensor of valid positions (same leading dims)
-    rot_weight, trans_weight : scalar weights
-
-    Returns
-    -------
-    total : scalar loss
-    breakdown : dict with rot_loss, trans_loss floats
-    """
-    R_pred = pred_T[..., :3, :3]
-    R_gt = gt_T[..., :3, :3]
-    t_pred = pred_T[..., :3, 3]
-    t_gt = gt_T[..., :3, 3]
-
-    if mask is not None:
-        R_pred = R_pred[mask]
-        R_gt = R_gt[mask]
-        t_pred = t_pred[mask]
-        t_gt = t_gt[mask]
-
-    if R_pred.numel() == 0:
-        zero = torch.tensor(0.0, device=pred_T.device, dtype=pred_T.dtype)
-        return zero, {"rot_loss": 0.0, "trans_loss": 0.0}
-
-    rot_l = geodesic_loss(R_pred, R_gt)
-    trans_l = F.mse_loss(t_pred, t_gt)
-
-    total = rot_weight * rot_l + trans_weight * trans_l
-    breakdown = {
-        "rot_loss": float(rot_l.detach().item()),
-        "trans_loss": float(trans_l.detach().item()),
-    }
-    return total, breakdown
+# ─── _se3_pose_loss is now imported from models.losses.pose_loss ─────────────
+# (was previously duplicated here with geodesic + MSE variant)
 
 
 # ─── Ground-truth multi-interval transforms ─────────────────────────────────

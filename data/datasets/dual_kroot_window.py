@@ -174,8 +174,10 @@ class ShortWindowDataset(torch.utils.data.IterableDataset):
         T_total: int,
         rng: random.Random,
     ) -> dict:
-        win_frames = frames_t[start:end].float().clone()
-        win_tforms = tforms_t[start:end].float().clone()
+        # Return raw dtype (uint8 frames, float32 tforms) — no .float().clone().
+        # Dtype promotion happens on GPU in the trainer.
+        win_frames = frames_t[start:end]
+        win_tforms = tforms_t[start:end]
 
         # Time-reversal augmentation
         if self.augment_flip and rng.random() < self.flip_prob:
@@ -205,13 +207,13 @@ class ShortWindowDataset(torch.utils.data.IterableDataset):
 
         if self.mode in ("val", "test"):
             # Eval: yield the full scan as a single sample (variable length)
-            gt_global = _normalise_global_transforms(tforms_t.float())
+            gt_global = _normalise_global_transforms(tforms_t)
             meta = _make_meta(
                 scan_id, info, T_total,
                 window_start=0, stride=1, k=T_total,
                 calib_matrix=self.calib_matrix, image_size=self.image_size,
             )
-            yield {"frames": frames_t.float(), "gt_global_T": gt_global, "meta": meta}
+            yield {"frames": frames_t, "gt_global_T": gt_global, "meta": meta}
             return
 
         tiles = self._compute_tiles(T_total, rng)
@@ -358,8 +360,9 @@ class LongWindowDataset(torch.utils.data.IterableDataset):
         rng: random.Random,
     ) -> dict:
         idx_tensor = torch.tensor(idx, dtype=torch.long)
-        win_frames = frames_t[idx_tensor].float().clone()     # (k, H, W)
-        win_tforms = tforms_t[idx_tensor].float().clone()     # (k, 4, 4)
+        # Return raw dtype — no .float().clone(). Promotion on GPU.
+        win_frames = frames_t[idx_tensor]                     # (k, H, W)
+        win_tforms = tforms_t[idx_tensor]                     # (k, 4, 4)
 
         # Time-reversal augmentation
         if self.augment_flip and rng.random() < self.flip_prob:
@@ -395,8 +398,7 @@ class LongWindowDataset(torch.utils.data.IterableDataset):
 
         if self.mode in ("val", "test"):
             # Eval: yield full scan with all frames + anchor index list
-            gt_global = _normalise_global_transforms(tforms_t.float())
-            # Also provide the sparse anchor indices for eval stitching
+            gt_global = _normalise_global_transforms(tforms_t)
             anchor_idx = list(range(0, T_total, self.s))
             idx_tensor = torch.tensor(anchor_idx, dtype=torch.long)
             meta = _make_meta(
@@ -405,7 +407,7 @@ class LongWindowDataset(torch.utils.data.IterableDataset):
                 calib_matrix=self.calib_matrix, image_size=self.image_size,
             )
             yield {
-                "frames": frames_t.float(),
+                "frames": frames_t,
                 "gt_global_T": gt_global,
                 "idx_long": idx_tensor,
                 "meta": meta,

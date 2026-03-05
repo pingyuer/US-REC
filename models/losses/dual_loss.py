@@ -18,69 +18,10 @@ import torch
 import torch.nn.functional as F
 
 from metrics.compose import local_from_global
-
-
-# ─── Smooth rotation + translation losses ────────────────────────────────────
-
-def chordal_rotation_loss(R_pred: torch.Tensor, R_gt: torch.Tensor) -> torch.Tensor:
-    """Chordal distance between rotation matrices.
-
-    .. math::
-        d_{chord}(R_1, R_2) = \\|R_1 - R_2\\|_F
-
-    This is everywhere-differentiable and avoids the acos singularity of
-    geodesic distance.  Relationship: :math:`d_{chord} = 2\\sqrt{2}\\sin(\\theta/2)`.
-
-    Parameters
-    ----------
-    R_pred, R_gt : (..., 3, 3)
-
-    Returns
-    -------
-    Scalar — mean chordal distance.
-    """
-    diff = R_pred - R_gt  # (..., 3, 3)
-    # Frobenius norm per sample: sqrt(sum of squared elements)
-    frob = torch.sqrt((diff * diff).sum(dim=(-2, -1)).clamp(min=1e-8))
-    return frob.mean()
-
-
-def _se3_pose_loss(
-    pred_T: torch.Tensor,
-    gt_T: torch.Tensor,
-    mask: torch.Tensor | None = None,
-    rot_weight: float = 1.0,
-    trans_weight: float = 1.0,
-) -> tuple[torch.Tensor, dict[str, float]]:
-    """Chordal rotation + Smooth-L1 translation loss.
-
-    Parameters
-    ----------
-    pred_T, gt_T : (..., 4, 4)
-    mask : optional bool mask of valid positions
-    """
-    R_pred = pred_T[..., :3, :3]
-    R_gt = gt_T[..., :3, :3]
-    t_pred = pred_T[..., :3, 3]
-    t_gt = gt_T[..., :3, 3]
-
-    if mask is not None:
-        R_pred = R_pred[mask]
-        R_gt = R_gt[mask]
-        t_pred = t_pred[mask]
-        t_gt = t_gt[mask]
-
-    if R_pred.numel() == 0:
-        zero = torch.tensor(0.0, device=pred_T.device, dtype=pred_T.dtype)
-        return zero, {"rot_loss": 0.0, "trans_loss": 0.0}
-
-    rot_l = chordal_rotation_loss(R_pred, R_gt)
-    trans_l = F.smooth_l1_loss(t_pred, t_gt, beta=1.0)
-    total = rot_weight * rot_l + trans_weight * trans_l
-    return total, {
-        "rot_loss": float(rot_l.detach()),
-        "trans_loss": float(trans_l.detach()),
-    }
+from models.losses.pose_loss import (  # noqa: F401 — re-export for backward compat
+    chordal_rotation_loss,
+    se3_chordal_loss as _se3_pose_loss,
+)
 
 
 # ─── Public API ──────────────────────────────────────────────────────────────

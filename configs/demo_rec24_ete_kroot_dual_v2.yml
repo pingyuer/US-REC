@@ -1,0 +1,288 @@
+# K-root DUAL V2 config — scientific PE + attention for Short + Long branches.
+#
+# V2 improvements over V1 (demo_rec24_ete_kroot_dual.yml):
+#   1. s = ceil(L_target_frames / (k-1)) instead of fixed sqrt(k).
+#   2. Short branch: RoPE + sliding-window causal attention.
+#   3. Long  branch: real-index sinusoidal PE + global causal attention.
+#   4. Stitch fusion: SE(3) log-space endpoint correction (same as V1).
+#   5. Diagnostic CSV output per scan.
+#
+# References:
+#   - 苏剑林 (Su Jianlin), "RoFormer: Enhanced Transformer with Rotary
+#     Position Embedding", 2021.
+#   - Vaswani et al., "Attention is All You Need" (sinusoidal PE).
+#
+# GPU memory budget (A30 24GB, estimated):
+#   V2 models are slightly larger than V1 due to explicit Q/K/V projections
+#   in V2TransformerLayer.  Peak ≈ 12.5 GB with bs=1, k=64, 480×640.
+#   Use grad_accum=8 for effective batch=8.
+#
+# Run:
+#   python main_rec.py --config configs/demo_rec24_ete_kroot_dual_v2.yml
+#   python main_rec.py --config configs/demo_rec24_ete_kroot_dual_v2.yml --eval-only
+
+# ---------------------------------------------------------------------------
+# Reproducibility
+# ---------------------------------------------------------------------------
+seed: 0
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+paths:
+  output_dir: logs
+
+# ---------------------------------------------------------------------------
+# K-root params — V2 scientific stride
+# ---------------------------------------------------------------------------
+kroot:
+  k: 64                           # token window length (both branches)
+  # V2: stride derived from target coverage
+  L_target_frames: 504            # desired real-frame span for long window
+  # s = ceil(504 / (64 - 1)) = ceil(8.0) = 8
+  # s is computed at runtime; this line is for reference only:
+  # s: 8
+
+# ---------------------------------------------------------------------------
+# Model — V2 dual branches with branch-specific PE + attention
+# ---------------------------------------------------------------------------
+model:
+  type: kroot_dual_v2
+  name: efficientnet_b1
+  pred_type: parameter
+  label_type: transform
+  in_ch_reg: 1
+  ddf_dirc: Move
+  conv_coords: optimised_coord
+  img_pro_coord: pro_coord
+  batch_norm: BNoff
+  use_voxelmorph: false
+  use_deform: false
+  use_backward: false
+  enable_voxel: false
+  interpolation:
+    method: bilinear
+    volume: fixed_interval
+  pose_head:
+    rotation_rep: rot6d
+
+  encoder:
+    backbone: efficientnet_b1
+    pretrained: true
+
+  # Shared transformer defaults
+  transformer:
+    d_model: 256
+    n_heads: 4
+    n_layers: 4
+    dim_feedforward: 1024
+    window_size: 64
+    dropout: 0.1
+
+  # V2 Short branch: RoPE + sliding-window causal
+  short:
+    transformer:
+      n_layers: 4
+      window_size: 64
+      attention_mode: sliding_window    # RoPE selected automatically
+
+  # V2 Long branch: real-index sinusoidal PE + global causal attention
+  long:
+    transformer:
+      n_layers: 4
+      window_size: 64                   # ignored when attention_mode=global
+      attention_mode: global            # full causal attention over all tokens
+      dilation: 1                       # set > 1 for dilated attention
+
+  image_size_h: 480
+  image_size_w: 640
+
+# ---------------------------------------------------------------------------
+# Dataset — V2 joint loader with scientific stride
+# ---------------------------------------------------------------------------
+dataset:
+  name: data.datasets.TUS_rec_s3.TUSRecS3Iterable
+  backend: s3
+  bucket: ${oc.env:TUS_REC24_BUCKET,tus-rec-24}
+  region: ${oc.env:TUS_REC24_REGION,us-east-1}
+  endpoint: ${oc.env:TUS_REC24_ENDPOINT,http://172.16.240.77:9000}
+  force_path_style: true
+  prefix:
+    train: train
+    val: val
+    test: val
+  frame_dir: frames
+  tform_dir:
+    train: null
+    val: transfs
+    test: transfs
+  landmark_dir: landmark
+  return_landmarks: false
+  max_keys: 2000
+  calib_file: ${oc.env:TUS_REC24_CALIB,s3://tus-rec-24/train/calib_matrix.csv}
+  resample_factor: 4
+  sampling:
+    pair_mode: adjacent
+    random_pairs_per_slice: null
+    shuffle_slices:
+      train: true
+      val: false
+      test: false
+    shuffle_pairs:
+      train: true
+      val: false
+      test: false
+    shuffle_buffer_size:
+      train: 4096
+      val: 0
+      test: 0
+    buffer_emit_prob:
+      train: 1.0
+      val: 1.0
+      test: 1.0
+    augment_direction_flip:
+      train: true
+      val: false
+      test: false
+    prefetch_slices: 4
+    seed: 0
+    num_samples: 100
+    sample_range: 100
+
+  # V2: triggers _build_kroot_dual_v2_joint_loaders in builder.py
+  sequence_mode: kroot_dual_v2
+
+  sequence_window: 64
+  short_overlap: 8
+  long_overlap_tokens: 0
+  long_window_stride: 32
+
+  # Augmentation
+  augment_flip: true
+  flip_prob: 0.5
+  augment:
+    reverse_prob: 0.5
+
+dataloader:
+  train:
+    batch_size: 1
+    num_workers: 4
+    shuffle: false
+    drop_last: false
+    pin_memory: true
+  val:
+    batch_size: 1
+    num_workers: 4
+    shuffle: false
+    drop_last: false
+    pin_memory: true
+  test:
+    batch_size: 1
+    num_workers: 4
+    shuffle: false
+    drop_last: false
+    pin_memory: true
+
+# ---------------------------------------------------------------------------
+# Optimizer
+# ---------------------------------------------------------------------------
+optimizer:
+  type: adamw
+  lr_rec: 5e-4
+  weight_decay: 1e-2
+  betas: [0.9, 0.999]
+  min_lr: 1e-6
+  warmup_steps: 200
+  encoder_lr_mult: 0.1
+
+# ---------------------------------------------------------------------------
+# Loss
+# ---------------------------------------------------------------------------
+loss:
+  rot_weight: 1.0
+  trans_weight: 1.0
+  short_weight: 1.0
+  long_weight: 1.0
+
+# ---------------------------------------------------------------------------
+# Trainer — V2
+# ---------------------------------------------------------------------------
+trainer:
+  name: trainers.kroot_dual_v2_trainer.KRootDualV2Trainer
+  max_epochs: 3
+  log_interval: 50
+  validate_every: 1
+  grad_accum: 8
+  max_grad_norm: 1.0
+  ema_decay: 0.999
+  rec_trainer:
+    non_improve_maxmum: 1e10
+    reg_loss_weight: 1000
+    val_loss_min: 1e10
+    val_dist_min: 1e10
+    val_loss_min_reg: 1e10
+    option: common_volume
+  mode:
+    inter: nointer
+    meta: nonmeta
+
+# ---------------------------------------------------------------------------
+# Stitch fusion
+# ---------------------------------------------------------------------------
+stitch:
+  enable_endpoint_interp: true
+  interp_space: se3_log
+  short_overlap: 8
+  long_window_stride: 32
+
+# ---------------------------------------------------------------------------
+# Evaluation — V2 adds CSV diagnostic output
+# ---------------------------------------------------------------------------
+data:
+  max_scans: null
+  max_frames_per_scan: null
+
+eval:
+  max_scans: null
+  csv_dir: null                    # set to e.g. "logs/csv" to enable per-scan CSV
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging:
+  mlflow:
+    enabled: true
+    tracking_uri: ${oc.env:MLFLOW_TRACKING_URI,"http://172.16.240.33:5000"}
+    experiment_name: ${oc.env:MLFLOW_EXPERIMENT_NAME,"rec"}
+    run_name: ${oc.env:MLFLOW_RUN_NAME,"${now:%Y%m%d_%H%M%S}_kroot_dual_v2"}
+    tags:
+      dataset: tus_rec24
+      model: kroot_dual_v2
+    log_system_metrics: false
+    artifact_subdir: artifacts
+    register_model: false
+    log_model_format: state_dict
+    best_metric: val_loss
+    best_mode: min
+
+runtime:
+  gpu_ids: "0"
+  multi_gpu: false
+
+checkpoint:
+  mlflow_run_id: null
+  mlflow_artifact: "checkpoints/best"
+  mlflow_search_best: true
+  local_path: null
+  load_on_eval: true
+  load_on_resume: true
+  strict: true
+
+viz:
+  enabled: true
+  drift_curve: true
+  pose_curve: true
+  recon_slices: false
+  save_png: true
+  save_csv: true
+  out_dir: null
