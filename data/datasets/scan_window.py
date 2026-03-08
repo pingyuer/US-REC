@@ -202,7 +202,10 @@ class ScanWindowDataset(torch.utils.data.IterableDataset):
         rng: random.Random,
     ) -> dict:
         """Extract and normalise a single window → sample dict."""
-        win_frames = frames_t[start:end].float().clone()
+        # Keep the original on-disk dtype (typically uint8) so CPU-side
+        # dataloader / pinned-memory usage stays low. The trainer normalises
+        # to float right before the model forward pass.
+        win_frames = frames_t[start:end].clone()
         win_tforms = tforms_t[start:end].float().clone()
 
         # Time-reversal augmentation
@@ -262,7 +265,9 @@ class ScanWindowDataset(torch.utils.data.IterableDataset):
             if self.image_size is not None:
                 meta["image_size"] = list(self.image_size)
             yield {
-                "frames": frames_t.float(),
+                # Same rationale as training mode: defer float conversion to the
+                # trainer to avoid materialising full-scan float32 tensors in CPU RAM.
+                "frames": frames_t,
                 "gt_global_T": gt_global,
                 "meta": meta,
             }

@@ -380,6 +380,8 @@ def ddf_surrogate_loss(
     *,
     image_size: tuple[int, int] = (480, 640),
     num_points: int = 1024,
+    use_rmse: bool = True,
+    loss_max: float = 0.0,
     generator: torch.Generator | None = None,
 ) -> torch.Tensor:
     """Dense-displacement-field surrogate loss using random pixel subsampling.
@@ -402,7 +404,7 @@ def ddf_surrogate_loss(
 
     Returns
     -------
-    loss : scalar MSE in mm² (differentiable w.r.t. pred_global_T)
+    loss : scalar (RMSE in mm or MSE in mm²), differentiable w.r.t. pred_global_T
     """
     B, T, _, _ = pred_global_T.shape
     H, W = image_size
@@ -426,7 +428,12 @@ def ddf_surrogate_loss(
     pred_world = (pred_global_T @ pts_tool)[..., :3, :].transpose(-2, -1)  # (B,T,K,3)
     gt_world   = (gt_global_T   @ pts_tool)[..., :3, :].transpose(-2, -1)  # (B,T,K,3)
 
-    return F.mse_loss(pred_world, gt_world)
+    loss = F.mse_loss(pred_world, gt_world)
+    if use_rmse:
+        loss = (loss + 1e-8).sqrt()  # mm² → mm, eps for grad stability
+    if loss_max > 0.0:
+        loss = torch.clamp(loss, max=loss_max)
+    return loss
 
 
 # ─── Combined sequence loss ─────────────────────────────────────────────────
@@ -450,6 +457,8 @@ def longseq_loss(
     ddf_num_points: int = 1024,
     ddf_tform_calib: torch.Tensor | None = None,
     ddf_image_size: tuple[int, int] = (480, 640),
+    ddf_use_rmse: bool = True,
+    ddf_loss_max: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Compute combined loss for long-sequence pose estimation.
 
@@ -534,6 +543,8 @@ def longseq_loss(
             tform_calib=ddf_tform_calib,
             image_size=ddf_image_size,
             num_points=ddf_num_points,
+            use_rmse=ddf_use_rmse,
+            loss_max=ddf_loss_max,
         )
     else:
         l_ddf = torch.tensor(0.0, device=device, dtype=dtype)

@@ -1,0 +1,344 @@
+# VQ-Memory Conditioned Local Pose Transformer — TUS-REC-24
+#
+# Architecture:
+#   1. Shared FrameEncoder (EfficientNet-B1)
+#   2. proj_vq → VQ codebook (anchor frames only)
+#   3. proj_tf → Local Transformer (window frames)
+#   4. Scan summary g from attention pooling of anchor VQ codes
+#   5. FiLM conditioning (g → ctx)
+#   6. VQ memory cross-attention (ctx × z_q → c_t)
+#   7. Pose head on ctx + c_t → local transforms
+#
+# Auxiliary losses: L_cons (summary consistency), L_geom (coarse trajectory)
+#
+# Entry point:
+#   python main_rec.py --config configs/demo_rec24_ete_vq_memory.yml
+#   python main_rec.py --config configs/demo_rec24_ete_vq_memory.yml --dry-run
+#   python main_rec.py --config configs/demo_rec24_ete_vq_memory.yml --eval-only
+
+# ---------------------------------------------------------------------------
+# Reproducibility
+# ---------------------------------------------------------------------------
+seed: 0
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+paths:
+  output_dir: logs
+  log_dir: null
+  ckpt_dir: null
+  cache_dir: null
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+model:
+  type: vq_memory
+  name: efficientnet_b1
+  pred_type: parameter
+  label_type: transform
+
+  pose_head:
+    rotation_rep: rot6d
+
+  # Shared early-CNN encoder
+  encoder:
+    backbone: efficientnet_b1
+    pretrained: true
+    input_h: 240             # resize from native 480×640 → 240×320 (~4× less compute)
+    input_w: 320
+
+  # Local transformer (same as longseq but used for window only)
+  transformer:
+    d_model: 256
+    n_heads: 4
+    n_layers: 4
+    dim_feedforward: 1024
+    window_size: 64
+    dropout: 0.1
+    seg_len: 0            # no Transformer-XL segmented recurrence in V1
+    memory_size: 0        # Transformer-XL disabled for VQ memory variant
+
+  # Anchor stride for VQ (every Nth frame is an anchor)
+  anchor_stride: 8
+
+  # Number of waypoints for geometry head
+  n_geom_waypoints: 8
+
+  # Image dimensions (for DDF loss pixel sampling)
+  image_size_h: 480
+  image_size_w: 640
+
+# ---------------------------------------------------------------------------
+# VQ Configuration
+# ---------------------------------------------------------------------------
+vq:
+  codebook_size: 512       # number of VQ codebook entries
+  code_dim: 256            # dimension of VQ codes (proj_vq output)
+  ema_decay: 0.97          # EMA decay for codebook updates (no backprop) — was 0.99, faster adaptation helps codebook utilization
+  anchor_stride: 8         # mirrors model.anchor_stride
+  n_geom_waypoints: 8      # waypoints for L_geom target
+
+# ---------------------------------------------------------------------------
+# Scan Summary Configuration
+# ---------------------------------------------------------------------------
+summary:
+  pool_type: attention     # "attention" (V1) or "latent" (V2)
+  latent_num: 8            # only used if pool_type=latent
+
+# ---------------------------------------------------------------------------
+# Memory Cross-Attention
+# ---------------------------------------------------------------------------
+memory:
+  use_cross_attn: true     # enable VQ memory cross-attention
+  num_heads: 4             # attention heads for memory queries
+  context_layers: 2        # contextualise anchor memories over the whole scan
+  context_heads: 4         # heads for the scan-level anchor transformer
+
+# ---------------------------------------------------------------------------
+# Conditioning (FiLM)
+# ---------------------------------------------------------------------------
+conditioning:
+  use_film: true           # apply FiLM (γ·x + β) with g
+  use_global_token: false  # additive global token injection
+
+# ---------------------------------------------------------------------------
+# Dataset (S3-backed)
+# ---------------------------------------------------------------------------
+dataset:
+  name: data.datasets.TUS_rec_s3.TUSRecS3Iterable
+  backend: s3
+  bucket: ${oc.env:TUS_REC24_BUCKET,tus-rec-24}
+  region: ${oc.env:TUS_REC24_REGION,us-east-1}
+  endpoint: ${oc.env:TUS_REC24_ENDPOINT,http://172.16.240.77:9000}
+  force_path_style: true
+  prefix:
+    train: train
+    val: val
+    test: val
+  frame_dir: frames
+  tform_dir:
+    train: null
+    val: transfs
+    test: transfs
+  landmark_dir: landmark
+  return_landmarks: false
+  max_keys: 2000
+  calib_file: ${oc.env:TUS_REC24_CALIB,s3://tus-rec-24/train/calib_matrix.csv}
+  resample_factor: 4
+  sampling:
+    pair_mode: adjacent
+    random_pairs_per_slice: null
+    shuffle_slices:
+      train: true
+      val: false
+      test: false
+    shuffle_pairs:
+      train: true
+      val: false
+      test: false
+    shuffle_buffer_size:
+      train: 4096
+      val: 0
+      test: 0
+    buffer_emit_prob:
+      train: 1.0
+      val: 1.0
+      test: 1.0
+    augment_direction_flip:
+      train: true
+      val: false
+      test: false
+    prefetch_slices: 4
+    seed: 0
+    num_samples: 100
+    sample_range: 100
+
+  # Scan-window mode for VQ memory trainer
+  sequence_mode: vq_memory         # uses VQMemoryScanWindowDataset
+  sequence_window: 128             # local window size
+  sampling_mode: tiled
+  tile_overlap: 0
+  min_tile_size: 128          # equal to window_size → no short tiles (enables batch_size>1)
+  max_tiles_per_scan: 0
+  windows_per_scan: 4
+
+  # Time-reversal augmentation
+  augment_flip: true
+  flip_prob: 0.5
+  augment:
+    reverse_prob: 0.5
+
+# ---------------------------------------------------------------------------
+# DataLoader
+# ---------------------------------------------------------------------------
+dataloader:
+  train:
+    batch_size: 2            # better GPU occupancy; still safe after keeping CPU-side frames as uint8
+    num_workers: 4           # raise CPU pipeline parallelism to keep the GPU fed
+    shuffle: false
+    drop_last: false
+    pin_memory: true         # faster H2D copies now that host RAM footprint is under control
+    persistent_workers: true # avoid worker teardown/startup bubbles between epochs
+    prefetch_factor: 2       # moderate prefetch; much lower than the original OOM-prone setting
+  val:
+    batch_size: 1
+    num_workers: 0
+    shuffle: false
+    drop_last: false
+    pin_memory: false
+  test:
+    batch_size: 1
+    num_workers: 0
+    shuffle: false
+    drop_last: false
+    pin_memory: false
+
+# ---------------------------------------------------------------------------
+# Optimizer
+# ---------------------------------------------------------------------------
+optimizer:
+  type: adamw
+  lr_rec: 5e-4
+  lr: 5e-4
+  weight_decay: 1e-2
+  encoder_lr_mult: 0.1      # encoder gets 10x lower LR
+  warmup_steps: 100         # was 200 — faster warmup so VQ codebook gets meaningful gradients sooner
+  min_lr: 1e-6
+
+# ---------------------------------------------------------------------------
+# Loss
+# ---------------------------------------------------------------------------
+loss:
+  type: MSE_points
+  rot_loss: geodesic
+  trans_loss: l2
+  rot_weight: 1.0
+  trans_weight: 1.0
+
+  # Multi-interval auxiliary loss (same as longseq)
+  aux_intervals: [2, 4, 8, 16]
+  aux_weight: 0.5
+  aux_decay: 0.5
+  aux_scale: none
+
+  # Points-based loss
+  mode: points
+  ref_pts_scale_mm: 20.0
+
+  # DDF surrogate loss
+  ddf_sample_weight: 0.05  # increased from 0.01 since RMSE brings scale from O(1000) to O(30)
+  ddf_num_points: 1024
+  ddf_use_rmse: true        # sqrt(MSE): mm² → mm, prevents scale mismatch with local loss
+  ddf_loss_max: 50.0        # clamp DDF loss to prevent P90+ gradient spikes
+
+  # Consistency constraint
+  consistency_weight: 0.1
+  consistency_delta: 2
+
+  # VQ-specific auxiliary losses
+  lambda_cons: 0.1          # L_cons: scan summary consistency
+  lambda_geom: 0.2          # L_geom: coarse trajectory regression — was 0.1, increase for drift control
+  lambda_commit: 0.15       # VQ commitment loss weight — was 0.25, effective is 3x (consistency views add 2 extra), so 0.15×3=0.45
+  lambda_endpoint: 0.15     # L_end: end-point drift constraint on composed global trajectory
+  lambda_contrast: 0.05     # L_ctr: in-batch InfoNCE on two scan summary views (adds negatives)
+  contrast_temperature: 0.2
+  cons_sample_ratio: 0.6    # fraction of anchors per consistency view
+
+# ---------------------------------------------------------------------------
+# Trainer
+# ---------------------------------------------------------------------------
+trainer:
+  name: trainers.vq_memory_trainer.VQMemoryTrainer
+  max_epochs: 3
+  log_interval: 50
+  validate_every: 1
+  save_interval: 100
+  grad_accum: 2               # effective batch ≈ 2 × 2 = 4; same optimizer statistics, higher device utilization
+  max_grad_norm: 1.0
+  ema_decay: 0.999            # EMA of model parameters
+  amp: bf16                   # mixed precision: bf16 on A30/A100 (or fp16, or false)
+
+  # For IterableDataset LR schedule estimation
+  steps_per_epoch: null
+  total_steps: null
+
+  mode:
+    inter: nointer
+    meta: nonmeta
+  rec_trainer:
+    non_improve_maxmum: 1e10
+    reg_loss_weight: 1000
+    val_loss_min: 1e10
+    val_dist_min: 1e10
+    val_loss_min_reg: 1e10
+    option: common_volume
+
+# ---------------------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------------------
+train:
+  max_steps: null
+  sequence_window: 128
+
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
+data:
+  max_scans: null
+  max_frames_per_scan: null
+
+eval:
+  max_scans: null
+  metric_mode: tusrec_ddf
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging:
+  mlflow:
+    enabled: true
+    tracking_uri: ${oc.env:MLFLOW_TRACKING_URI,"http://172.16.240.33:5000"}
+    experiment_name: ${oc.env:MLFLOW_EXPERIMENT_NAME,"rec"}
+    run_name: ${oc.env:MLFLOW_RUN_NAME,"${now:%Y%m%d_%H%M%S}_vq_memory"}
+    tags:
+      dataset: tus_rec24
+      model: vq_memory
+    log_system_metrics: false
+    artifact_subdir: artifacts
+    register_model: false
+    log_model_format: state_dict
+    best_metric: val_tusrec_final_score
+    best_mode: max
+
+runtime:
+  gpu_ids: "0"
+  multi_gpu: false
+
+# ---------------------------------------------------------------------------
+# Checkpoint
+# ---------------------------------------------------------------------------
+checkpoint:
+  mlflow_run_id: null
+  mlflow_artifact: "checkpoints/best"
+  mlflow_search_best: true
+  local_path: null
+  load_on_eval: true
+  load_on_resume: true
+  strict: true
+  save_optimizer: true
+  best_metric: val_loss
+  best_mode: min
+
+# ---------------------------------------------------------------------------
+# Visualisation
+# ---------------------------------------------------------------------------
+viz:
+  enabled: true
+  drift_curve: true
+  pose_curve: true
+  recon_slices: false
+  save_png: true
+  save_csv: true
+  out_dir: null

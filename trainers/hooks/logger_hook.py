@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -11,6 +12,12 @@ from .registry import register_hook
 class LoggerHook(Hook):
     """
     Minimal logger hook: local heartbeat (file/console) only.
+
+    Produces two files inside the run directory:
+      * ``train.log``    — continuous step / epoch / val heartbeats.
+      * ``metrics.log``  — one structured block per validation epoch,
+                           containing every numeric metric in log_buffer.
+                           Serves as an offline backup before MLflow push.
     """
 
     priority = 90
@@ -35,6 +42,7 @@ class LoggerHook(Hook):
         self.artifact_path = str(artifact_path)
         self.flush_interval = int(flush_interval)
         self._fp = None
+        self._metrics_fp = None
         self._write_count = 0
 
     def before_run(self, trainer, mode: str = "train"):
@@ -91,6 +99,9 @@ class LoggerHook(Hook):
             msg += f" (best val_loss={best_val_loss:.6f} @ epoch={best_epoch})"
         self._writeln(msg)
 
+        # Write all numeric metrics to the metrics log (offline MLflow backup)
+        self._write_metrics_block(epoch, log_buffer)
+
     def after_test(self, trainer, log_buffer=None):
         if not log_buffer:
             return
@@ -109,6 +120,32 @@ class LoggerHook(Hook):
             if self._write_count % self.flush_interval == 0:
                 self._fp.flush()
 
+    def _write_metrics_block(self, epoch: int, buf: dict) -> None:
+        """Append a structured metrics block to metrics.log."""
+        if self._metrics_fp is None:
+            return
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        lines = [f"\n=== val epoch={epoch}  [{ts}] ==="]
+        # Separate keys: put val_loss / best_val_loss first, then the rest sorted
+        priority_keys = ["val_loss", "best_val_loss", "best_epoch", "lr"]
+        skip_keys = {"epoch", "is_best", "scan_globals", "tusrec_per_scan"}
+        seen: set[str] = set()
+        for k in priority_keys:
+            if k in buf and buf[k] is not None:
+                v = buf[k]
+                lines.append(f"  {k:<40s}: {v:.6g}" if isinstance(v, float) else f"  {k:<40s}: {v}")
+                seen.add(k)
+        for k in sorted(buf.keys()):
+            if k in seen or k in skip_keys:
+                continue
+            v = buf[k]
+            if isinstance(v, float):
+                lines.append(f"  {k:<40s}: {v:.6g}")
+            elif isinstance(v, int):
+                lines.append(f"  {k:<40s}: {v}")
+        self._metrics_fp.write("\n".join(lines) + "\n")
+        self._metrics_fp.flush()
+
     def _open_log(self, trainer) -> None:
         if self._fp is not None:
             return
@@ -123,9 +160,17 @@ class LoggerHook(Hook):
         self._fp = path.open("a", encoding="utf-8")
         self._writeln(f"[run] log_file={path}")
 
+        # Open companion metrics.log in the same directory
+        metrics_path = path.parent / "metrics.log"
+        self._metrics_fp = metrics_path.open("a", encoding="utf-8")
+        self._writeln(f"[run] metrics_log={metrics_path}")
+
     def _close_log(self) -> None:
-        if self._fp is None:
-            return
-        self._fp.flush()
-        self._fp.close()
-        self._fp = None
+        if self._fp is not None:
+            self._fp.flush()
+            self._fp.close()
+            self._fp = None
+        if self._metrics_fp is not None:
+            self._metrics_fp.flush()
+            self._metrics_fp.close()
+            self._metrics_fp = None

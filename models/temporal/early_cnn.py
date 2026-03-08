@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torchvision.models import (
     efficientnet_b0,
     efficientnet_b1,
@@ -41,9 +42,12 @@ class FrameEncoder(nn.Module):
         in_channels: int = 1,
         token_dim: int | None = 256,
         pretrained: bool = False,
+        input_size: tuple[int, int] | None = None,
     ):
         super().__init__()
         self.backbone_name = backbone
+        # If set, resize input frames to (H, W) before the CNN.
+        self.input_size = tuple(input_size) if input_size else None
 
         if backbone == "efficientnet_b0":
             weights = EfficientNet_B0_Weights.DEFAULT if pretrained else None
@@ -105,6 +109,8 @@ class FrameEncoder(nn.Module):
         -------
         token : (B, D)
         """
+        if self.input_size is not None and (x.shape[-2], x.shape[-1]) != self.input_size:
+            x = F.interpolate(x, size=self.input_size, mode="bilinear", align_corners=False)
         feat = self.features(x)             # (B, backbone_dim, h, w)
         feat = self.avgpool(feat)           # (B, backbone_dim, 1, 1)
         feat = feat.flatten(1)              # (B, backbone_dim)
@@ -115,7 +121,7 @@ class FrameEncoder(nn.Module):
     def encode_sequence(
         self,
         frames: torch.Tensor,
-        chunk_size: int = 16,
+        chunk_size: int = 32,
     ) -> torch.Tensor:
         """Encode a sequence of frames independently, in memory-efficient chunks.
 

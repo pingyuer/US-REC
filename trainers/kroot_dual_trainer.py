@@ -126,6 +126,11 @@ class KRootDualTrainer(BaseTrainer):
         self.val_loader = val_loader
         self._use_joint = joint_train_loader is not None
 
+        # Signal to main_rec.py / build_hooks that this trainer has its own
+        # evaluate() that understands the joint {"short": …, "long": …} batch
+        # format and must NOT be dispatched to the generic RecEvaluator.
+        self.fusion_mode = "stitch"
+
         # ── K-root params ────────────────────────────────────────────
         self.k = int(cfg_get(cfg, "kroot.k", 64))
         self.s = resolve_kroot_stride(cfg, k=self.k)
@@ -179,7 +184,16 @@ class KRootDualTrainer(BaseTrainer):
         self.stitch_long_window_stride = int(
             cfg_get(cfg, "stitch.long_window_stride", max(1, self.k - 1))
         )
-
+        # ── Eval diagnostics & pose-graph backend ─────────────────────
+        # diagnostics_level:
+        #   0 = silent, 1 = shape/NaN/divergence checks,
+        #   2 = level-1 + GT-baseline score,  3 = level-2 + DDF direction
+        self.diagnostics_level = int(cfg_get(cfg, "eval.diagnostics_level", 1))
+        # pose_graph_refine: run GN pose-graph as additional post-processing
+        self.pose_graph_refine = bool(cfg_get(cfg, "eval.pose_graph_refine", False))
+        self.pg_w_short = float(cfg_get(cfg, "eval.pg_w_short", 1.0))
+        self.pg_w_long = float(cfg_get(cfg, "eval.pg_w_long", 0.3))
+        self.pg_n_iters = int(cfg_get(cfg, "eval.pg_n_iters", 5))
         # ── Calibration ─────────────────────────────────────────────
         self.tform_calib: torch.Tensor | None = load_tform_calib(
             cfg, device=self.device, warn_prefix="KRootDual",
@@ -437,15 +451,22 @@ class KRootDualTrainer(BaseTrainer):
     def evaluate(self, loader=None) -> dict[str, float]:
         """Evaluate both models with stitch fusion on full-scan data.
 
-        For each scan in the loader:
-        1. Run short + long inference via sliding windows
-        2. Stitch: long anchors + short refinement + SE(3) endpoint correction
-        3. Compute GPE/LPE/drift for fused / short_only / long_only
+        Automatically runs pipeline diagnostics (level = self.diagnostics_level)
+        and optionally applies a pose-graph refinement pass.
         """
         if loader is None:
             loader = self.val_loader
         if loader is None:
             return {}
+
+        # ── Log eval split provenance ──────────────────────────────
+        ds = getattr(loader, "dataset", None)
+        ds_cls = type(ds).__name__ if ds is not None else "?"
+        print(
+            f"[evaluate] split=val  dataset_class={ds_cls}  "
+            f"diagnostics_level={self.diagnostics_level}  "
+            f"pose_graph_refine={self.pose_graph_refine}"
+        )
 
         # Apply EMA weights
         short_backup = long_backup = None
@@ -460,6 +481,7 @@ class KRootDualTrainer(BaseTrainer):
         all_metrics: list[dict[str, float]] = []
         scan_globals: dict[str, dict] = {}
         scan_count = 0
+        first_scan_diagnosed = False  # run full diagnostics on first scan only
 
         for batch in loader:
             frames = batch["frames"].to(self.device)        # (1, T, H, W)
@@ -482,6 +504,52 @@ class KRootDualTrainer(BaseTrainer):
                     enable_endpoint_interp=self.enable_endpoint_interp,
                 )
 
+                # ── Optional: pose-graph refinement ─────────────────
+                if self.pose_graph_refine:
+                    try:
+                        from eval.pose_graph import pose_graph_refine as _pg  # noqa: PLC0415
+                        fused_pg = _pg(
+                            short_local=result["short_local"],
+                            long_local=result["long_local"],
+                            anchor_indices=result["anchor_indices"],
+                            init_global=result["fused_global"],
+                            w_short=self.pg_w_short,
+                            w_long=self.pg_w_long,
+                            n_iters=self.pg_n_iters,
+                        )
+                        result["fused_pg_global"] = fused_pg
+                    except Exception as _pg_exc:
+                        warnings.warn(f"[evaluate] pose_graph failed: {_pg_exc}")
+
+                # ── Diagnostics (full on scan 0; summary only thereafter) ──
+                if self.diagnostics_level > 0:
+                    _diag_level = self.diagnostics_level if not first_scan_diagnosed else 1
+                    meta = batch.get("meta")
+                    _sid = f"scan_{scan_count}"
+                    if isinstance(meta, dict):
+                        raw = meta.get("scan_id") or meta.get("scan_name")
+                        if isinstance(raw, (list, tuple)):
+                            _sid = str(raw[b]) if b < len(raw) else str(raw[0])
+                        elif raw is not None:
+                            _sid = str(raw)
+                    try:
+                        from eval.diagnostics import run_pipeline_diagnostics  # noqa: PLC0415
+                        diag = run_pipeline_diagnostics(
+                            fused_global=result["fused_global"],
+                            short_global=result["short_global"],
+                            long_global=result["long_global"],
+                            gt_global=gt_g,
+                            anchor_indices=result["anchor_indices"],
+                            tform_calib=self.tform_calib,
+                            scan_id=_sid,
+                            diagnostics_level=_diag_level,
+                            frames=scan_frames if _diag_level >= 2 else None,
+                        )
+                        print(diag["summary"])
+                        first_scan_diagnosed = True
+                    except Exception as _diag_exc:
+                        warnings.warn(f"[evaluate] diagnostics failed: {_diag_exc}")
+
                 metrics = compute_stitch_metrics(
                     fused_global=result["fused_global"],
                     short_global=result["short_global"],
@@ -491,6 +559,27 @@ class KRootDualTrainer(BaseTrainer):
                     tform_calib=self.tform_calib,
                     frames=scan_frames if self.tform_calib is not None else None,
                 )
+
+                # If pose-graph ran, also compute its metrics
+                if "fused_pg_global" in result:
+                    try:
+                        from eval.kroot_stitch import compute_stitch_metrics as _csm  # noqa
+                        pg_met = _csm(
+                            fused_global=result["fused_pg_global"],
+                            short_global=result["short_global"],
+                            long_global=result["long_global"],
+                            anchor_indices=result["anchor_indices"],
+                            gt_global=gt_g,
+                            tform_calib=self.tform_calib,
+                            frames=scan_frames if self.tform_calib is not None else None,
+                        )
+                        # Prefix pg_ to avoid overwriting stitch metrics
+                        for k_m, v_m in pg_met.items():
+                            if isinstance(v_m, float):
+                                metrics[f"pg_{k_m}"] = v_m
+                    except Exception as _exc:
+                        warnings.warn(f"[evaluate] pg metrics failed: {_exc}")
+
                 all_metrics.append(metrics)
 
                 # Store per-scan globals for VizHook
@@ -507,6 +596,8 @@ class KRootDualTrainer(BaseTrainer):
                     "gt": gt_g.detach().cpu(),
                 }
                 scan_count += 1
+
+        print(f"[evaluate] finished  num_scans={scan_count}  (metric accumulators are local to this call)")
 
         # Restore original (non-EMA) weights
         if short_backup is not None:
@@ -527,5 +618,17 @@ class KRootDualTrainer(BaseTrainer):
 
         agg["num_scans"] = float(scan_count)
         agg["scan_globals"] = scan_globals  # type: ignore
+
+        # Print compact divergence summary across all scans
+        for metric in (
+            "mean_divergence_fused_vs_short_t_mm",
+            "mean_divergence_fused_vs_long_t_mm",
+            "mean_gpe_mm_fused",
+            "mean_tusrec_GPE_mm_fused",
+            "mean_tusrec_LPE_mm_fused",
+            "mean_tusrec_final_score_fused",
+        ):
+            if metric in agg:
+                print(f"[evaluate] {metric}: {agg[metric]:.4f}")
 
         return agg

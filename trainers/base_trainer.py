@@ -29,6 +29,25 @@ from trainers.common import cfg_get, EMA, warmup_cosine_lr
 from trainers.hooks.base_hook import Hook
 
 
+def _resolve_amp_dtype(cfg) -> torch.dtype | None:
+    """Return the autocast dtype from config, or None to disable AMP.
+
+    Config key ``trainer.amp`` can be:
+        - ``true`` / ``"bf16"``  → torch.bfloat16  (preferred on A30/A100)
+        - ``"fp16"``             → torch.float16
+        - ``false`` / ``null``   → None (disabled)
+    """
+    val = cfg_get(cfg, "trainer.amp", False)
+    if val is None or val is False or str(val).lower() in ("false", "none", "off", "0"):
+        return None
+    s = str(val).lower()
+    if s in ("true", "bf16", "bfloat16"):
+        return torch.bfloat16
+    if s in ("fp16", "float16"):
+        return torch.float16
+    return None
+
+
 class BaseTrainer(ABC):
     """Training skeleton shared by LongSeq / Dual / KRoot / KRootDual trainers.
 
@@ -79,6 +98,27 @@ class BaseTrainer(ABC):
         )
         self.min_lr = float(cfg_get(cfg, "optimizer.min_lr", 1e-6))
         self.warmup_steps = int(cfg_get(cfg, "optimizer.warmup_steps", 0))
+
+        # Optional explicit overrides so IterableDataset trainers can get a
+        # reliable cosine schedule without a len(loader) fallback.
+        #   trainer.total_steps       — override the entire schedule length
+        #   trainer.steps_per_epoch   — used when loader has no len()
+        self._cfg_total_steps = cfg_get(cfg, "trainer.total_steps")
+        if self._cfg_total_steps is not None:
+            self._cfg_total_steps = int(self._cfg_total_steps)
+        self._cfg_steps_per_epoch = cfg_get(cfg, "trainer.steps_per_epoch")
+        if self._cfg_steps_per_epoch is not None:
+            self._cfg_steps_per_epoch = int(self._cfg_steps_per_epoch)
+
+        # ── AMP (Automatic Mixed Precision) ─────────────────────────
+        self._amp_dtype = _resolve_amp_dtype(cfg)
+        self._use_amp = self._amp_dtype is not None
+        # GradScaler only needed for fp16 (bf16 doesn't need loss scaling)
+        self._grad_scaler = (
+            torch.amp.GradScaler("cuda")
+            if self._use_amp and self._amp_dtype == torch.float16
+            else None
+        )
 
     # ------------------------------------------------------------------
     # Hook management (identical across all trainers)
@@ -138,10 +178,19 @@ class BaseTrainer(ABC):
 
     def _clip_step_zero(self) -> None:
         """Gradient clip → optimizer step → zero_grad for all model/opt pairs."""
-        for m, opt in self._models_and_optimizers():
-            torch.nn.utils.clip_grad_norm_(m.parameters(), max_norm=self.max_grad_norm)
-            opt.step()
-            opt.zero_grad()
+        if self._grad_scaler is not None:
+            # FP16 path: unscale → clip → scaler.step → update
+            for m, opt in self._models_and_optimizers():
+                self._grad_scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(m.parameters(), max_norm=self.max_grad_norm)
+                self._grad_scaler.step(opt)
+                opt.zero_grad()
+            self._grad_scaler.update()
+        else:
+            for m, opt in self._models_and_optimizers():
+                torch.nn.utils.clip_grad_norm_(m.parameters(), max_norm=self.max_grad_norm)
+                opt.step()
+                opt.zero_grad()
 
     def _update_lr(self) -> float:
         """Update LR for all optimizers using warmup + cosine schedule."""
@@ -160,13 +209,29 @@ class BaseTrainer(ABC):
         return new_lr
 
     def _estimate_total_steps(self) -> int:
+        # 1. Explicit max_steps from config (highest priority)
         if self.max_steps is not None:
             return self.max_steps
+        # 2. Explicit total_steps override (e.g. for IterableDataset runs)
+        if getattr(self, "_cfg_total_steps", None) is not None:
+            return self._cfg_total_steps
+        # 3. Try to get len() from the train loader
         try:
             loader_len = len(self._get_train_loader())
+            steps_per_epoch = max(1, loader_len // self.grad_accum)
         except TypeError:
-            loader_len = 100
-        steps_per_epoch = max(1, loader_len // self.grad_accum)
+            # IterableDataset — fall back to explicit config or a hard-coded
+            # sentinel that keeps the schedule from degenerating.
+            # Use trainer.steps_per_epoch if set, otherwise 500 (per epoch).
+            fallback = getattr(self, "_cfg_steps_per_epoch", None) or 500
+            import warnings as _warnings
+            _warnings.warn(
+                f"[{self.__class__.__name__}] train loader has no len() — "
+                f"estimating {fallback} steps/epoch for LR schedule. "
+                f"Set trainer.steps_per_epoch in config for an accurate schedule.",
+                stacklevel=3,
+            )
+            steps_per_epoch = fallback
         return steps_per_epoch * self.num_epochs
 
     # Hooks into the train loop that subclasses may override
@@ -259,8 +324,18 @@ class BaseTrainer(ABC):
                 n_micro += 1
                 self.call_hooks("before_step")
 
-                loss, metrics = self._run_step(batch)
-                (loss / self.grad_accum).backward()
+                with torch.amp.autocast(
+                    "cuda",
+                    enabled=self._use_amp,
+                    dtype=self._amp_dtype or torch.float32,
+                ):
+                    loss, metrics = self._run_step(batch)
+                    scaled_loss = loss / self.grad_accum
+
+                if self._grad_scaler is not None:
+                    self._grad_scaler.scale(scaled_loss).backward()
+                else:
+                    scaled_loss.backward()
                 accum_loss += float(loss.item())
 
                 if n_micro % self.grad_accum == 0:

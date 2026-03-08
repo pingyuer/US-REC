@@ -37,6 +37,9 @@ def _per_frame_point_error(
     T = gt_global.shape[0]
     device = gt_global.device
 
+    # Ensure all tensors are on the same device as gt_global
+    tform_calib = tform_calib.to(device=device, dtype=gt_global.dtype)
+
     if image_points is not None:
         pts = image_points.to(device=device, dtype=gt_global.dtype)
     else:

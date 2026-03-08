@@ -14,6 +14,13 @@ from .loss import compute_loss
 from .interp_reg import scatter_pts_interpolation, scatter_pts_registration
 from .model_io import save_rec_model, save_reg_model, load_model, save_best_models
 from .bn_utils import switch_off_batch_norm
+from .vq_memory import (
+    valid_length,
+    pad_sequence_list,
+    build_batched_scan_cache,
+    build_consistency_views,
+    build_masked_geom_targets,
+)
 
 __all__ = [
     "get_cfg_value",
@@ -34,4 +41,9 @@ __all__ = [
     "load_model",
     "save_best_models",
     "switch_off_batch_norm",
+    "valid_length",
+    "pad_sequence_list",
+    "build_batched_scan_cache",
+    "build_consistency_views",
+    "build_masked_geom_targets",
 ]

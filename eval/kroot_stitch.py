@@ -213,6 +213,52 @@ def stitch_long_base_short_refine(
     }
 
 
+@torch.no_grad()
+def stitch_with_pose_graph(
+    short_model: torch.nn.Module,
+    long_model: torch.nn.Module,
+    scan_frames: torch.Tensor,
+    k: int,
+    s: int,
+    device: torch.device,
+    *,
+    short_overlap: int = 8,
+    long_window_stride: Optional[int] = None,
+    enable_endpoint_interp: bool = True,
+    pg_w_short: float = 1.0,
+    pg_w_long: float = 0.3,
+    pg_n_iters: int = 5,
+) -> Dict[str, torch.Tensor]:
+    """Stitch pipeline + SE(3) pose-graph refinement as post-processing.
+
+    Runs ``stitch_long_base_short_refine`` for initialisation, then refines
+    all poses jointly using a GN pose-graph solver that respects both short
+    (dense) and long (sparse anchor) constraints.
+
+    Returns same keys as ``stitch_long_base_short_refine`` plus
+    ``"fused_pg_global"`` — the pose-graph refined trajectory.
+    """
+    result = stitch_long_base_short_refine(
+        short_model, long_model, scan_frames, k, s, device,
+        short_overlap=short_overlap,
+        long_window_stride=long_window_stride,
+        enable_endpoint_interp=enable_endpoint_interp,
+    )
+
+    from eval.pose_graph import pose_graph_refine  # noqa: PLC0415
+    fused_pg = pose_graph_refine(
+        short_local=result["short_local"],
+        long_local=result["long_local"],
+        anchor_indices=result["anchor_indices"],
+        init_global=result["fused_global"],
+        w_short=pg_w_short,
+        w_long=pg_w_long,
+        n_iters=pg_n_iters,
+    )
+    result["fused_pg_global"] = fused_pg
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Sliding window inference helpers
 # ---------------------------------------------------------------------------
@@ -365,17 +411,41 @@ def compute_stitch_metrics(
         (long_full[-1, :3, 3] - gt_global[-1, :3, 3]).norm().item()
     )
 
+    # ── Trajectory divergence (evidence that fusion did something) ────
+    td_means: dict[str, float] = {}
+    for n_a, a in [("fused", fused_global), ("short", short_global)]:
+        for n_b, b_t in [("fused", fused_global), ("short", short_global), ("long", long_full)]:
+            if n_a >= n_b:
+                continue
+            diff_t = (a[:, :3, 3] - b_t[:, :3, 3]).norm(dim=-1).mean()
+            diff_key = f"divergence_{n_a}_vs_{n_b}_t_mm"
+            v = float(diff_t.item())
+            metrics[diff_key] = v
+            td_means[diff_key] = v
+
+    if td_means.get("divergence_fused_vs_short_t_mm", 0.0) < 1.0:
+        warnings.warn(
+            "[kroot_stitch] fused ≈ short (divergence < 1mm). "
+            "Likely: model outputs near-identity (not yet converged) "
+            "OR long correction has no effect. Run diagnostics_level>=2 for evidence."
+        )
+
     # ── Official TUS-REC DDF metrics (if calibration available) ──
     if tform_calib is not None and frames is not None:
         try:
             from trainers.metrics.tusrec import compute_tusrec_metrics as _tusrec
-            for name, pred_g in [("fused", fused_global), ("short_only", short_global)]:
+            for name, pred_g in [
+                ("fused", fused_global),
+                ("short_only", short_global),
+                ("long_only", long_full),
+            ]:
                 tr = _tusrec(
                     frames=frames,
                     gt_transforms=gt_global,
                     pred_transforms=pred_g,
                     calib={"tform_calib": tform_calib},
                     compute_scores=True,
+                    enforce_lp_gp_distinct=True,
                 )
                 for k_m, v_m in tr.items():
                     if v_m is not None:

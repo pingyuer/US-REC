@@ -153,7 +153,7 @@ dataset:
   sequence_mode: kroot_dual_v2
 
   sequence_window: 64
-  short_overlap: 8
+  short_overlap: 32    # 50 % overlap; was 8 — more context at window boundaries
   long_overlap_tokens: 0
   long_window_stride: 32
 
@@ -192,7 +192,10 @@ optimizer:
   weight_decay: 1e-2
   betas: [0.9, 0.999]
   min_lr: 1e-6
-  warmup_steps: 200
+  # warmup_steps must be << total training steps.  With IterableDataset
+  # len(loader) is unavailable; BaseTrainer falls back to 500 steps/epoch.
+  # 3 epochs × 500 ÷ grad_accum=8 ≈ 187 optimiser steps → keep warmup ≤ 50.
+  warmup_steps: 30
   encoder_lr_mult: 0.1
 
 # ---------------------------------------------------------------------------
@@ -209,12 +212,16 @@ loss:
 # ---------------------------------------------------------------------------
 trainer:
   name: trainers.kroot_dual_v2_trainer.KRootDualV2Trainer
-  max_epochs: 3
+  max_epochs: 10
   log_interval: 50
   validate_every: 1
   grad_accum: 8
   max_grad_norm: 1.0
   ema_decay: 0.999
+  # For IterableDataset where len(loader) is unavailable, set this so the
+  # cosine LR schedule uses a realistic total_steps estimate.
+  # Effective optimiser steps ≈ steps_per_epoch * max_epochs / grad_accum.
+  # steps_per_epoch: 500   # uncomment and tune if LR schedule looks wrong
   rec_trainer:
     non_improve_maxmum: 1e10
     reg_loss_weight: 1000
@@ -232,7 +239,7 @@ trainer:
 stitch:
   enable_endpoint_interp: true
   interp_space: se3_log
-  short_overlap: 8
+  short_overlap: 32   # must match dataset.short_overlap
   long_window_stride: 32
 
 # ---------------------------------------------------------------------------
@@ -245,6 +252,15 @@ data:
 eval:
   max_scans: null
   csv_dir: null                    # set to e.g. "logs/csv" to enable per-scan CSV
+  # diagnostics_level:
+  #   0=off, 1=shape/NaN/divergence, 2=+GT-baseline score, 3=+DDF direction
+  diagnostics_level: 2
+  # Set pose_graph_refine: true to run GN pose-graph as post-processing.
+  # Typically ignored until model converges; mainly useful for ablation.
+  pose_graph_refine: false
+  pg_w_short: 1.0
+  pg_w_long: 0.3
+  pg_n_iters: 5
 
 # ---------------------------------------------------------------------------
 # Logging

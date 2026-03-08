@@ -176,8 +176,6 @@ def main(argv=None) -> int:
         ckpt_cfg = OmegaConf.select(cfg, "checkpoint") or {}
         if OmegaConf.is_config(ckpt_cfg):
             ckpt_cfg = OmegaConf.to_container(ckpt_cfg, resolve=True)
-        if bool(ckpt_cfg.get("load_on_eval", True)):
-            load_checkpoint(trainer.model, cfg, device, ctx=ctx)
 
         # Build hooks and start the MLflow run so VizHook can upload artifacts
         eval_hooks = build_hooks(cfg, ctx, trainer=trainer)
@@ -186,11 +184,34 @@ def main(argv=None) -> int:
             mlflow_hook.before_run(trainer, mode="test")
         eval_callbacks = [h for h in eval_hooks if hasattr(h, "on_end")]
 
-        # Dual-path trainer has its own evaluate() with fusion support
+        # Dual-path trainer has its own evaluate() with fusion support;
+        # it also manages its own checkpoint loading (short_model + long_model).
         is_dual = hasattr(trainer, "fusion_mode")
+
+        if bool(ckpt_cfg.get("load_on_eval", True)):
+            if is_dual and hasattr(trainer, "load_full_checkpoint"):
+                # Use the trainer's own full checkpoint loader
+                from trainers.utils.checkpoint_loader import _resolve_local_path  # noqa: PLC0415
+                ckpt_path = _resolve_local_path(str(dirs.get("run_dir", "")), ckpt_cfg.get("local_path"))
+                if ckpt_path is not None:
+                    trainer.load_full_checkpoint(str(ckpt_path))
+                else:
+                    # Fall back to model-property-based loading (uses nn.ModuleDict wrapper)
+                    load_checkpoint(trainer.model, cfg, device, ctx=ctx)
+            else:
+                load_checkpoint(trainer.model, cfg, device, ctx=ctx)
+
         if is_dual:
             eval_loader = getattr(trainer, "val_loader", None)
             metrics = trainer.evaluate(eval_loader)
+            # Fire on_end callbacks (VizHook etc.) that RecEvaluator would normally trigger
+            for cb in eval_callbacks:
+                fn = getattr(cb, "on_end", None)
+                if callable(fn):
+                    try:
+                        fn(metrics=metrics, mode="test", epoch=None, ctx=ctx, loader=eval_loader)
+                    except Exception as _cb_exc:
+                        print(f"[eval] {cb.__class__.__name__}.on_end failed: {_cb_exc}")
         else:
             evaluator = RecEvaluator(device=device)
             eval_loader = getattr(trainer, "val_loader", None)

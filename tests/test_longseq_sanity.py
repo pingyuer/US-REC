@@ -357,7 +357,8 @@ class TestDDFSurrogateLoss:
         loss = ddf_surrogate_loss(
             gt_global, gt_global, tform_calib=calib, image_size=(64, 64), num_points=32
         )
-        assert loss.item() < 1e-10, f"Expected ~0 for perfect pred, got {loss.item()}"
+        # With use_rmse=True (default), perfect pred gives sqrt(0 + 1e-8) = 1e-4
+        assert loss.item() < 2e-4, f"Expected ~0 for perfect pred, got {loss.item()}"
 
     def test_nonzero_for_imperfect(self):
         """DDF loss > 0 when pred ≠ gt."""
@@ -429,7 +430,7 @@ class TestDDFSurrogateLoss:
             intervals=[],
             ddf_sample_weight=0.0,
         )
-        assert bd_with["loss_ddf"] < 1e-10, f"DDF loss should be ~0 for perfect prediction, got {bd_with['loss_ddf']}"
+        assert bd_with["loss_ddf"] < 2e-4, f"DDF loss should be ~0 for perfect prediction, got {bd_with['loss_ddf']}"
         assert bd_without["loss_ddf"] == 0.0
 
 
